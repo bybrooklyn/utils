@@ -1,0 +1,28 @@
+[Unit]
+Description=pirate: qBittorrent inside the VPN namespace
+BindsTo=pirate-netns.service
+Wants=pirate-vpnd.service
+After=pirate-netns.service pirate-vpnd.service user@@UID@.service systemd-user-sessions.service
+RequiresMountsFor=@HOME@
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Type=exec
+User=@USER@
+Group=@GROUP@
+NetworkNamespacePath=/run/netns/pirate
+BindReadOnlyPaths=/etc/pirate/resolve:/run/systemd/resolve
+BindReadOnlyPaths=/etc/pirate/nsswitch.conf:/etc/nsswitch.conf
+Environment=HOME=@HOME@ XDG_RUNTIME_DIR=/run/user/@UID@ WAYLAND_DISPLAY=wayland-0 QT_QPA_PLATFORM=wayland
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/@UID@/bus XDG_SESSION_TYPE=wayland
+Environment=XDG_CURRENT_DESKTOP=KDE KDE_FULL_SESSION=true KDE_SESSION_VERSION=6
+EnvironmentFile=-/run/user/@UID@/pirate/session.env
+ExecStartPre=+/usr/local/lib/pirate/pirate-netns check
+ExecStartPre=/usr/local/lib/pirate/pirate-netns check-self
+ExecStart=/usr/bin/qbittorrent
+KillMode=mixed
+TimeoutStartSec=30
+TimeoutStopSec=90
+Restart=on-failure
+RestartSec=5

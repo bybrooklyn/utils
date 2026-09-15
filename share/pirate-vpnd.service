@@ -1,0 +1,22 @@
+[Unit]
+Description=pirate: WireGuard health, server failover, NAT-PMP port forwarding
+BindsTo=pirate-netns.service
+After=pirate-netns.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=all
+Environment=PIRATE_USER=@USER@
+ExecStart=/usr/local/lib/pirate/pirate-vpnd
+ExecReload=/bin/kill -HUP $MAINPID
+TimeoutStartSec=20
+WatchdogSec=120
+Restart=always
+RestartSec=5
+RuntimeDirectory=pirate
+RuntimeDirectoryMode=0755
+StateDirectory=pirate
+
+[Install]
+WantedBy=multi-user.target

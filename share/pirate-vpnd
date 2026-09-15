@@ -1,0 +1,399 @@
+#!/usr/bin/env bash
+# pirate-vpnd — keeps the pirate namespace's WireGuard tunnel useful: watches the
+# handshake, fails over between Proton P2P servers, renews the NAT-PMP port
+# forward, pushes the port into qBittorrent, and stops any qBittorrent running
+# outside the namespace. Status for `pirate status` is written to /run/pirate.
+set -uo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/bin
+
+IF=wgpirate
+NSP=/run/netns/pirate
+LIB=/usr/local/lib/pirate
+ETC=/etc/pirate
+RUN=/run/pirate
+STATE=/var/lib/pirate
+GW=10.2.0.1
+QBT=http://127.0.0.1:8080/api/v2
+
+USER_NAME=${PIRATE_USER:?PIRATE_USER must be set (see pirate-vpnd.service)}
+USER_ID=$(id -u "$USER_NAME")
+USER_GID=$(id -g "$USER_NAME")
+USER_HOME=$(getent passwd "$USER_NAME" | cut -d: -f6)
+USER_CONFIG=$USER_HOME/.config/pirate/config
+REQUEST=$USER_HOME/.local/state/pirate/request
+
+TICK=15             # main loop period
+RENEW=45            # NAT-PMP lease is 60 s
+HS_MAX=180          # handshake older than this = tunnel dead (rekey happens every 120 s)
+GRACE=25            # after changing peer, wait this long before judging it
+NOHS_SWITCH=60      # no handshake this long → switch server
+NAT_FAIL_SWITCH=4   # consecutive NAT-PMP failures → switch server
+BAD_TTL=1800        # failed servers are skipped for 30 min
+LOSS_NOTIFY=60      # only notify about outages lasting this long
+
+log()  { printf '<6>%s\n' "$*"; }
+warn() { printf '<4>%s\n' "$*"; }
+err()  { printf '<3>%s\n' "$*"; }
+nsx()  { nsenter --net="$NSP" "$@"; }
+sd()   { systemd-notify "$@" 2>/dev/null || true; }
+put()  { printf '%s\n' "$2" >"$RUN/$1.tmp" && mv -f "$RUN/$1.tmp" "$RUN/$1"; }
+meta() { sed -n "s/^$1=//p" "$ETC/wg.meta" | head -1; }
+
+nap() {
+    sleep "$1" &
+    nap_pid=$!
+    wait "$nap_pid" 2>/dev/null
+    nap_pid=""
+}
+
+notify() {  # urgency summary body
+    [[ -S /run/user/$USER_ID/bus ]] || return 0
+    timeout 5 setpriv --reuid="$USER_ID" --regid="$USER_GID" --init-groups \
+        env -i HOME="$USER_HOME" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$USER_ID/bus" \
+        /usr/bin/notify-send -a pirate -i network-vpn -u "$1" "$2" "${3:-}" &>/dev/null &
+}
+
+transition() {  # state detail
+    put detail "$2"
+    sd "STATUS=$1: $2"
+    [[ $1 == "$state" ]] && return
+    log "state: ${state:-start} → $1 ($2)"
+    put status "$1"
+    state=$1
+    if [[ $1 == connected ]]; then
+        loss_since=0
+        if ((notified_loss)); then
+            notify low "pirate: VPN back online" "$2"
+            notified_loss=0
+        fi
+    elif ((loss_since == 0)); then
+        loss_since=$EPOCHSECONDS
+    fi
+}
+
+load_user_config() {
+    local v
+    COUNTRY="" SERVER="" KILL_HOST_QBT=yes
+    [[ -r $USER_CONFIG ]] || return 0
+    v=$(grep -oP '^COUNTRY="?\K[A-Za-z]{2}(?="?\s*(#.*)?$)' "$USER_CONFIG" | tail -1) && COUNTRY=${v^^}
+    v=$(grep -oP '^SERVER="?\K[A-Za-z]{2}(-[A-Za-z]{2})?#[0-9]+(?="?\s*(#.*)?$)' "$USER_CONFIG" | tail -1) && SERVER=${v^^}
+    v=$(grep -oP '^KILL_HOST_QBT="?\K(yes|no)(?="?\s*(#.*)?$)' "$USER_CONFIG" | tail -1) && KILL_HOST_QBT=$v
+    return 0
+}
+
+# ---------- servers ----------
+
+mark_bad() { echo "$1 $((EPOCHSECONDS + BAD_TTL))" >>"$STATE/bad"; }
+
+bad_ips_json() {
+    [[ -s $STATE/bad ]] || { echo '[]'; return; }
+    awk -v now="$EPOCHSECONDS" '$2 > now { print $1 }' "$STATE/bad" | jq -Rsc 'split("\n") | map(select(length > 0))'
+}
+
+refresh_peer() {
+    local line
+    line=$(nsx wg show "$IF" endpoints 2>/dev/null | head -1)
+    CUR_PUB=${line%%$'\t'*}
+    CUR_EP=${line#*$'\t'}
+    CUR_IP=${CUR_EP%:*}
+    CUR_NAME=$(jq -r --arg p "$CUR_PUB" --arg ip "$CUR_IP" \
+        'first(.servers[] | select(.pub == $p and .ip == $ip) | .n) // empty' "$ETC/servers.json" 2>/dev/null)
+    if [[ -z $CUR_NAME ]]; then
+        [[ $CUR_PUB == "$ORIGIN_PUB" ]] && CUR_NAME=$ORIGIN_NAME || CUR_NAME=$CUR_IP
+    fi
+}
+
+# best server: requested name > preferred country > anything; skipping current + bad IPs
+pick_server() {  # bad-ips-json
+    jq -r --arg cc "${COUNTRY:-$ORIGIN_CC}" --arg want "$SERVER" --arg cur "$CUR_IP" --argjson bad "$1" '
+        [.servers[] | select(.ip != $cur and ((.ip | IN($bad[])) | not))] as $pool
+        | [$pool[] | select($want != "" and .n == $want)] as $named
+        | [$pool[] | select(.cc == $cc)] as $local
+        | (if ($named | length) > 0 then $named elif ($local | length) > 0 then $local else $pool end)
+        | first(.[] | "\(.n) \(.pub) \(.ip)") // empty' "$ETC/servers.json" 2>/dev/null
+}
+
+switch_server() {  # reason
+    local cand name pub ip
+    cand=$(pick_server "$(bad_ips_json)")
+    if [[ -z $cand ]]; then
+        if [[ $CUR_IP != "$ORIGIN_IP" ]]; then
+            cand="$ORIGIN_NAME $ORIGIN_PUB $ORIGIN_IP"
+        else
+            rm -f "$STATE/bad"
+            cand=$(pick_server '[]')
+        fi
+    fi
+    read -r name pub ip <<<"$cand"
+    [[ -n ${pub:-} ]] || { warn "no other server available"; return 1; }
+    if ! out=$("$LIB/pirate-netns" setpeer "$name" "$pub" "$ip:$WG_PORT" 2>&1); then
+        err "couldn't switch peer: $out"
+        return 1
+    fi
+    rm -f "$RUN/port"
+    have_port=0 nat_fail=0 nohs_since=0 grace_until=$((EPOCHSECONDS + GRACE)) next_renew=0
+    switches=$((switches + 1))
+    refresh_peer
+    log "switched to $name ($ip): $1"
+    transition switching "$1 → $name"
+    ((switches <= 2)) && notify normal "pirate: switched VPN server" "$1 → $name"
+    return 0
+}
+
+maybe_expired() {
+    ((${#dead_servers[@]} >= 4)) || return 0
+    [[ $(timeout 5 nmcli -t -f CONNECTIVITY general 2>/dev/null) == full ]] || return 0
+    transition expired "no Proton server answers this WireGuard key"
+    if ((!expired_notified)); then
+        notify critical "pirate: VPN config expired?" \
+            "No Proton server answers this WireGuard key. Renew it at account.protonvpn.com → Downloads → WireGuard (Extend), or this network blocks UDP $WG_PORT. With a new file run: pirate config <file>"
+        expired_notified=1
+    fi
+}
+
+# ---------- NAT-PMP ----------
+
+natpmp_renew() {
+    local out port tport ip
+    if out=$(nsx timeout 8 natpmpc -a 1 0 udp 60 -g "$GW" 2>&1) &&
+        port=$(grep -oP 'Mapped public port \K[0-9]+' <<<"$out") &&
+        out=$(nsx timeout 8 natpmpc -a 1 0 tcp 60 -g "$GW" 2>&1) &&
+        tport=$(grep -oP 'Mapped public port \K[0-9]+' <<<"$out"); then
+        ip=$(grep -oP 'Public IP address : \K[0-9.]+' <<<"$out" || true)
+        [[ $port == "$tport" ]] || warn "UDP port $port != TCP port $tport; using $tport"
+        port=$tport
+        nat_fail=0 have_port=1 switches=0 degraded_notified=0 next_renew=$((EPOCHSECONDS + RENEW))
+        natpmp_refused=()
+        [[ $port == "$(cat "$RUN/port" 2>/dev/null)" ]] || log "forwarded port $port on $CUR_NAME (${ip:-?})"
+        put port "$port"
+        put public_ip "${ip:-unknown}"
+        put server "$CUR_NAME"
+        put endpoint "$CUR_EP"
+        echo "$CUR_NAME $CUR_PUB $CUR_EP" >"$STATE/peer"
+        transition connected "$CUR_NAME · ${ip:-?} · port $port"
+        return 0
+    fi
+    nat_fail=$((nat_fail + 1)) next_renew=$EPOCHSECONDS
+    warn "NAT-PMP failed on $CUR_NAME ($nat_fail/$NAT_FAIL_SWITCH): $(tail -1 <<<"$out")"
+    ((nat_fail >= NAT_FAIL_SWITCH)) || return 1
+    natpmp_refused+=("$CUR_IP")
+    mark_bad "$CUR_IP"
+    if ((${#natpmp_refused[@]} >= 3)); then
+        transition degraded "tunnel works but Proton refuses port forwarding"
+        if ((!degraded_notified)); then
+            notify critical "pirate: port forwarding refused" \
+                "Proton refused port forwarding on 3 servers. The WireGuard config probably has NAT-PMP off — download one with NAT-PMP on and run: pirate config <file>"
+            degraded_notified=1
+        fi
+        nat_fail=0 next_renew=$((EPOCHSECONDS + 120))
+    else
+        switch_server "port forwarding failing on $CUR_NAME"
+    fi
+    return 1
+}
+
+# ---------- qBittorrent ----------
+
+qbt_api() { nsx curl -sf --max-time 4 "$@"; }
+
+qbt_sync() {
+    local prefs port cs
+    if ! prefs=$(qbt_api "$QBT/app/preferences"); then
+        put qbt offline
+        qbt_disc=0
+        return
+    fi
+    if ((have_port)); then
+        port=$(cat "$RUN/port")
+        if [[ $(jq -r '"\(.listen_port) \(.upnp) \(.current_network_interface)"' <<<"$prefs") != "$port false $IF" ]]; then
+            qbt_api --data-urlencode "json={\"listen_port\":$port,\"upnp\":false,\"current_network_interface\":\"$IF\"}" \
+                "$QBT/app/setPreferences" >/dev/null && log "qBittorrent: listen port → $port"
+        fi
+    fi
+    cs=$(qbt_api "$QBT/transfer/info" | jq -r '.connection_status // "unknown"')
+    put qbt "${cs:-unknown}"
+    # qBittorrent can give up on the interface if it started before the tunnel: bounce the port
+    if [[ $cs == disconnected ]] && ((have_port)); then
+        qbt_disc=$((qbt_disc + 1))
+        if ((qbt_disc >= 2 && EPOCHSECONDS - last_bump > 300)); then
+            warn "qBittorrent isn't listening on $IF — making it rebind"
+            qbt_api --data-urlencode "json={\"listen_port\":$((port < 65535 ? port + 1 : port - 1))}" "$QBT/app/setPreferences" >/dev/null
+            sleep 3
+            qbt_api --data-urlencode "json={\"listen_port\":$port}" "$QBT/app/setPreferences" >/dev/null
+            last_bump=$EPOCHSECONDS qbt_disc=0
+        fi
+    else
+        qbt_disc=0
+    fi
+}
+
+# Any qBittorrent of ours in the host network namespace is unprotected.
+leak_guard() {
+    local pid ns age
+    for pid in $(pgrep -u "$USER_ID" -x qbittorrent); do
+        ns=$(stat -Lc %i "/proc/$pid/ns/net" 2>/dev/null) || continue
+        [[ $ns == "$HOST_NS" ]] || continue
+        age=$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')
+        ((${age:-0} >= 5)) || continue
+        [[ " ${warned_pids[*]} " == *" $pid "* ]] && continue
+        warned_pids+=("$pid")
+        err "qBittorrent (pid $pid) is running OUTSIDE the VPN namespace"
+        if [[ $KILL_HOST_QBT == yes ]]; then
+            kill -TERM "$pid" 2>/dev/null
+            notify critical "pirate: stopped unprotected qBittorrent" \
+                "qBittorrent was started outside the VPN. Open it from the app menu or with 'pirate open'."
+        else
+            notify critical "pirate: qBittorrent is running outside the VPN" \
+                "Close it and open it from the app menu or with 'pirate open'."
+        fi
+    done
+}
+
+# ---------- requests from `pirate` ----------
+
+check_requests() {
+    local m oc=$COUNTRY os=$SERVER
+    m=$(stat -c %Y "$USER_CONFIG" 2>/dev/null || echo 0)
+    if [[ $m != "$cfg_mtime" ]]; then
+        cfg_mtime=$m
+        load_user_config
+        if [[ $COUNTRY != "$oc" || $SERVER != "$os" ]]; then
+            log "settings changed: country=${COUNTRY:-auto} server=${SERVER:-auto}"
+            want_switch=1
+        fi
+    fi
+    m=$(stat -c %Y "$REQUEST" 2>/dev/null || echo 0)
+    if [[ $m != "$req_mtime" ]]; then
+        req_mtime=$m
+        grep -q '^reconnect' "$REQUEST" 2>/dev/null && want_reconnect=1
+    fi
+}
+
+# ---------- main ----------
+
+main() {
+    mkdir -p "$RUN" "$STATE"
+    chmod 755 "$RUN"
+    [[ -r $ETC/wg.meta && -r $ETC/servers.json ]] || { err "not set up — run 'pirate'"; exit 1; }
+    ORIGIN_NAME=$(meta PEER_NAME) ORIGIN_PUB=$(meta PEER_PUB) ORIGIN_EP=$(meta ENDPOINT) ORIGIN_CC=$(meta COUNTRY)
+    ORIGIN_IP=${ORIGIN_EP%:*} WG_PORT=${ORIGIN_EP##*:}
+    HOST_NS=$(stat -Lc %i /proc/1/ns/net)
+
+    state="" loss_since=0 notified_loss=0 nap_pid=""
+    have_port=0 nat_fail=0 nohs_since=0 switches=0 next_renew=0 next_switch_at=0
+    grace_until=$((EPOCHSECONDS + GRACE)) last_bump=0 qbt_disc=0
+    expired_notified=0 degraded_notified=0 want_switch=0 want_reconnect=0
+    dead_servers=() natpmp_refused=() warned_pids=()
+    load_user_config
+    cfg_mtime=$(stat -c %Y "$USER_CONFIG" 2>/dev/null || echo 0)
+    req_mtime=$(stat -c %Y "$REQUEST" 2>/dev/null || echo 0)
+
+    trap '[[ -n $nap_pid ]] && kill "$nap_pid" 2>/dev/null' HUP
+    trap 'exit 0' TERM INT
+
+    refresh_peer
+    sd READY=1
+    log "pirate-vpnd started (origin $ORIGIN_NAME, current $CUR_NAME)"
+    transition connecting "starting"
+
+    local last_tick=$EPOCHSECONDS route_key="" rk now hs out
+    while true; do
+        sd WATCHDOG=1
+        now=$EPOCHSECONDS
+        put updated "$now"
+
+        # suspend/resume or a stalled loop: re-set the endpoint and check immediately
+        if ((now - last_tick > 3 * TICK)); then
+            log "resumed after $((now - last_tick))s — re-checking the tunnel"
+            nsx wg set "$IF" peer "$CUR_PUB" endpoint "$CUR_EP" 2>/dev/null
+            nohs_since=0 nat_fail=0 next_renew=0 grace_until=$((now + GRACE))
+        fi
+        last_tick=$now
+
+        # namespace invariants; repair or fail closed
+        if ! out=$("$LIB/pirate-netns" check 2>&1); then
+            warn "namespace problem: $out — repairing"
+            if ! out=$("$LIB/pirate-netns" repair 2>&1); then
+                err "namespace repair failed: $out"
+                systemctl stop pirate-qbittorrent.service
+                transition error "namespace broken: $out"
+                nap "$TICK"
+                continue
+            fi
+            refresh_peer
+        fi
+
+        leak_guard
+
+        # host uplink
+        if ! rk=$(ip -o route get "${CUR_IP:-$ORIGIN_IP}" 2>/dev/null | grep -oP 'dev \S+( src \S+)?'); then
+            transition no-network "host has no route to the VPN server"
+            have_port=0
+            rm -f "$RUN/port"
+            nap "$TICK"
+            continue
+        fi
+        if [[ $rk != "$route_key" ]]; then
+            if [[ -n $route_key ]]; then
+                log "network changed ($route_key → $rk)"
+                nsx wg set "$IF" peer "$CUR_PUB" endpoint "$CUR_EP" 2>/dev/null
+                nohs_since=0 nat_fail=0 next_renew=0 grace_until=$((now + GRACE))
+            fi
+            route_key=$rk
+        fi
+
+        check_requests
+        if ((want_reconnect)); then
+            want_reconnect=0
+            log "reconnect requested"
+            "$LIB/pirate-netns" reconnect 2>&1 | while read -r l; do warn "$l"; done
+            have_port=0 nat_fail=0 nohs_since=0 next_renew=0 grace_until=$((now + GRACE))
+            rm -f "$RUN/port"
+            transition connecting "reconnecting to $CUR_NAME"
+        fi
+        if ((want_switch)); then
+            want_switch=0 switches=0
+            switch_server "switching to ${SERVER:-${COUNTRY:-best server}}"
+        fi
+
+        # tunnel health
+        hs=$(nsx wg show "$IF" latest-handshakes 2>/dev/null | awk '{ print $2; exit }')
+        hs=${hs:-0}
+        put handshake "$hs"
+        if ((hs > 0 && now - hs < HS_MAX)); then
+            nohs_since=0 dead_servers=() expired_notified=0 next_switch_at=0
+            if ((now >= next_renew || !have_port)) && ((now >= grace_until || hs > grace_until - GRACE)); then
+                natpmp_renew
+            fi
+        else
+            have_port=0
+            rm -f "$RUN/port"
+            nsx ping -c1 -W1 "$GW" &>/dev/null   # give WireGuard a packet to handshake for
+            if ((now >= grace_until)); then
+                ((nohs_since)) || nohs_since=$now
+                [[ $state == expired ]] || transition connecting "waiting for handshake with $CUR_NAME"
+                if ((now - nohs_since >= NOHS_SWITCH && now >= next_switch_at)); then
+                    warn "no handshake with $CUR_NAME for $((now - nohs_since))s"
+                    dead_servers+=("$CUR_IP")
+                    mark_bad "$CUR_IP"
+                    maybe_expired
+                    switch_server "no response from $CUR_NAME"
+                    ((switches >= 5)) && next_switch_at=$((now + 120))
+                fi
+            fi
+        fi
+
+        # outage notification (debounced)
+        if [[ $state != connected ]] && ((loss_since && !notified_loss && now - loss_since >= LOSS_NOTIFY)); then
+            case $state in
+                expired|degraded|no-network) ;;
+                *) notify normal "pirate: VPN not connected" "$(cat "$RUN/detail" 2>/dev/null)"; notified_loss=1 ;;
+            esac
+        fi
+
+        qbt_sync
+        nap "$TICK"
+    done
+}
+
+main "$@"

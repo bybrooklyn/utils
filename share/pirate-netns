@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+# pirate-netns — the "pirate" network namespace holding the Proton WireGuard
+# interface. Only lo + wgpirate exist inside it, so anything running there
+# (qBittorrent) can reach the internet only through the VPN.
+#
+#   up | down | repair      create / remove / idempotently fix the namespace (root)
+#   reload                  apply a newly imported config (root)
+#   setpeer NAME PUB IP:PORT, reconnect    change / re-handshake the peer (root)
+#   check                   verify namespace invariants (root)
+#   check-self [--no-gui]   verify the calling process is correctly sandboxed
+#   doctor                  full leak/health test report (root)
+#   parse FILE              validate a Proton WireGuard .conf, print metadata (any user)
+set -euo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/bin
+
+NS=pirate
+IF=wgpirate
+NSP=/run/netns/$NS
+ETC=/etc/pirate
+CONF=$ETC/wg.conf
+STATE=/var/lib/pirate
+GW=10.2.0.1
+MARK=0x80000   # Tailscale's bypass mark: keeps WireGuard UDP off a Tailscale exit node
+PIRATE_USER=${PIRATE_USER:-${SUDO_USER:-}}   # set by the units; `sudo pirate-netns doctor` falls back to SUDO_USER
+
+die() { echo "pirate-netns: $*" >&2; exit 1; }
+nsx() { nsenter --net="$NSP" "$@"; }
+lock() { exec 9>/run/pirate-netns.lock; flock -w 30 9 || die "busy (lock timeout)"; }
+
+valid_pub() { [[ $1 =~ ^[A-Za-z0-9+/]{43}=$ ]]; }
+valid_ep()  { [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{1,5}$ ]]; }
+
+# conf_get FILE SECTION KEY — first value of KEY in [SECTION], comments stripped
+conf_get() {
+    awk -v sec="$2" -v key="$3" '
+        /^[[:space:]]*\[/ { cur = $0; gsub(/[][[:space:]]/, "", cur); next }
+        cur == sec {
+            line = $0; sub(/#.*/, "", line)
+            if (match(line, "^[[:space:]]*" key "[[:space:]]*=")) {
+                val = substr(line, RLENGTH + 1)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", val)
+                print val; exit
+            }
+        }' "$1"
+}
+
+conf_addr() { conf_get "$1" Interface Address | tr ',' '\n' | tr -d ' ' | grep -m1 -E '^[0-9.]+/[0-9]+$'; }
+conf_mtu()  { local m; m=$(conf_get "$1" Interface MTU); [[ $m =~ ^[0-9]{3,4}$ ]] && echo "$m" || echo 1420; }
+
+# WireGuard config for `wg setconf`, fed through stdin so the key never hits argv
+setconf_text() {  # PUB ENDPOINT
+    printf '[Interface]\nPrivateKey = %s\nFwMark = %s\n\n[Peer]\nPublicKey = %s\nEndpoint = %s\nAllowedIPs = 0.0.0.0/0\nPersistentKeepalive = 25\n' \
+        "$(conf_get "$CONF" Interface PrivateKey)" "$MARK" "$1" "$2"
+}
+
+# Last known-good peer if valid, else the one from the imported config: "PUB ENDPOINT"
+choose_peer() {
+    local name pub ep
+    if [[ -r $STATE/peer ]] && read -r name pub ep <"$STATE/peer" && valid_pub "$pub" && valid_ep "$ep"; then
+        echo "$pub $ep"
+    else
+        echo "$(conf_get "$CONF" Peer PublicKey) $(conf_get "$CONF" Peer Endpoint)"
+    fi
+}
+
+own_pub() { conf_get "$CONF" Interface PrivateKey | wg pubkey; }
+
+cmd_up() {
+    lock
+    [[ -r $CONF ]] || die "$CONF missing — run 'pirate'"
+    modprobe wireguard 2>/dev/null || true
+    # a namespace file left behind by a crash that no longer is a namespace
+    if [[ -e $NSP ]] && ! ip -n "$NS" link show lo &>/dev/null; then
+        ip netns del "$NS" 2>/dev/null || rm -f "$NSP"
+    fi
+    [[ -e $NSP ]] || ip netns add "$NS"
+    ip -n "$NS" link set lo up
+    nsx sysctl -qw net.ipv6.conf.all.disable_ipv6=1 net.ipv6.conf.default.disable_ipv6=1
+    local pub ep
+    if ! ip -n "$NS" link show "$IF" &>/dev/null; then
+        ip link del "$IF" 2>/dev/null || true          # half-finished run left it in the host
+        ip link add "$IF" type wireguard               # born in the host → its UDP socket stays there
+        ip link set "$IF" netns "$NS"
+        read -r pub ep < <(choose_peer)
+        nsx wg setconf "$IF" /dev/stdin <<<"$(setconf_text "$pub" "$ep")"
+    elif [[ $(nsx wg show "$IF" public-key 2>/dev/null) != "$(own_pub)" ]]; then
+        read -r pub ep < <(choose_peer)
+        nsx wg setconf "$IF" /dev/stdin <<<"$(setconf_text "$pub" "$ep")"
+    fi
+    ip -n "$NS" addr replace "$(conf_addr "$CONF")" dev "$IF"
+    ip -n "$NS" link set "$IF" mtu "$(conf_mtu "$CONF")" up
+    ip -n "$NS" route replace default dev "$IF"
+    cmd_check
+}
+
+cmd_down() {
+    lock
+    ip netns del "$NS" 2>/dev/null || true
+    ip link del "$IF" 2>/dev/null || true
+}
+
+cmd_reload() {
+    lock
+    rm -f "$STATE/peer" "$STATE/bad"
+    ip -n "$NS" link show "$IF" &>/dev/null || die "namespace not up"
+    nsx wg setconf "$IF" /dev/stdin <<<"$(setconf_text "$(conf_get "$CONF" Peer PublicKey)" "$(conf_get "$CONF" Peer Endpoint)")"
+    ip -n "$NS" addr flush dev "$IF"
+    ip -n "$NS" addr add "$(conf_addr "$CONF")" dev "$IF"
+    ip -n "$NS" link set "$IF" mtu "$(conf_mtu "$CONF")" up
+    ip -n "$NS" route replace default dev "$IF"
+    cmd_check
+}
+
+cmd_setpeer() {  # NAME PUB ENDPOINT
+    lock
+    local pub=$2 ep=$3 old p
+    valid_pub "$pub" && valid_ep "$ep" || die "invalid peer: $pub $ep"
+    old=$(nsx wg show "$IF" peers)
+    nsx wg set "$IF" peer "$pub" endpoint "$ep" persistent-keepalive 25 allowed-ips 0.0.0.0/0
+    for p in $old; do
+        [[ $p == "$pub" ]] || nsx wg set "$IF" peer "$p" remove
+    done
+}
+
+cmd_reconnect() {  # drop and re-add the current peer to force a fresh handshake
+    lock
+    local line pub ep
+    line=$(nsx wg show "$IF" endpoints | head -1)
+    pub=${line%%$'\t'*} ep=${line#*$'\t'}
+    valid_pub "$pub" && valid_ep "$ep" || die "no current peer"
+    nsx wg set "$IF" peer "$pub" remove
+    nsx wg set "$IF" peer "$pub" endpoint "$ep" persistent-keepalive 25 allowed-ips 0.0.0.0/0
+}
+
+cmd_check() {
+    local links
+    [[ -e $NSP ]] || die "namespace missing"
+    links=$(ip -n "$NS" -o link show | awk -F': ' '{ sub(/@.*/, "", $2); print $2 }' | sort | tr '\n' ' ')
+    [[ $links == "lo $IF " ]] || die "unexpected interfaces in namespace: $links"
+    ip -n "$NS" -o link show "$IF" | grep -q '[<,]UP[,>]' || die "$IF is down"
+    ip -n "$NS" -4 route show default | grep -q "^default dev $IF" || die "no default route via $IF"
+    [[ $(nsx cat /proc/sys/net/ipv6/conf/all/disable_ipv6) == 1 ]] || die "IPv6 enabled in namespace"
+    # look in the host namespace explicitly: this check also runs from inside the namespace
+    ! nsenter --net=/proc/1/ns/net ip link show "$IF" &>/dev/null || die "$IF exists outside the namespace"
+}
+
+cmd_check_self() {  # [--no-gui]
+    [[ $(stat -Lc %i /proc/self/ns/net) == "$(stat -Lc %i "$NSP")" ]] || die "not inside the pirate namespace"
+    [[ $(awk '$1 == "nameserver" { print $2 }' /etc/resolv.conf | sort -u | tr '\n' ' ') == "$GW " ]] ||
+        die "DNS isn't pointed at the VPN ($GW)"
+    [[ ! -e /run/systemd/resolve/io.systemd.Resolve ]] || die "systemd-resolved socket is visible (DNS leak)"
+    ! grep -Eq '^hosts:.*\bresolve\b' /etc/nsswitch.conf || die "nsswitch uses systemd-resolved (DNS leak)"
+    [[ $(awk 'NR > 2 { sub(":", "", $1); print $1 }' /proc/net/dev | sort | tr '\n' ' ') == "lo $IF " ]] ||
+        die "unexpected network interfaces"
+    [[ ${1:-} == --no-gui ]] || [[ -S ${XDG_RUNTIME_DIR:-/nonexistent}/${WAYLAND_DISPLAY:-wayland-0} ]] ||
+        die "no Wayland session socket"
+}
+
+cmd_doctor() {
+    local fails=0 port host_ip vpn_ip out mtu hs
+    pass() { echo "  ✓ $*"; }
+    flunk() { echo "  ✗ $*"; fails=$((fails + 1)); }
+    note() { echo "  ! $*"; }
+    local sandbox=(systemd-run --quiet --pipe --wait --collect
+        -p User="$PIRATE_USER" -p NetworkNamespacePath="$NSP"
+        -p BindReadOnlyPaths="$ETC/resolve:/run/systemd/resolve"
+        -p BindReadOnlyPaths="$ETC/nsswitch.conf:/etc/nsswitch.conf" --)
+
+    if out=$(cmd_check 2>&1); then pass "namespace contains only lo + $IF, default route via $IF, IPv6 off"
+    else flunk "namespace: $out"; return 1; fi
+
+    port=$(nsx wg show "$IF" listen-port)
+    if ss -uanH "sport = :$port" | grep -q .; then pass "WireGuard UDP socket (port $port) lives in the host namespace"
+    else flunk "WireGuard UDP socket not found in the host namespace"; fi
+
+    hs=$(nsx wg show "$IF" latest-handshakes | awk '{ print $2; exit }')
+    if ((${hs:-0} > 0 && $(date +%s) - hs < 180)); then pass "handshake $(($(date +%s) - hs))s ago"
+    else flunk "no recent WireGuard handshake"; fi
+
+    if out=$("${sandbox[@]}" "$0" check-self --no-gui 2>&1); then pass "sandbox: DNS → $GW only, resolved socket hidden, nsswitch safe"
+    else flunk "sandbox: $out"; fi
+
+    host_ip=$(curl -4s --max-time 10 https://api.ipify.org || true)
+    vpn_ip=$("${sandbox[@]}" curl -4s --max-time 15 https://api.ipify.org 2>/dev/null || true)
+    if [[ -n $vpn_ip && $vpn_ip != "$host_ip" ]]; then pass "split tunnel: host ${host_ip:-?}, namespace $vpn_ip"
+    else flunk "split tunnel: host ${host_ip:-?}, namespace ${vpn_ip:-unreachable}"; fi
+
+    if "${sandbox[@]}" getent ahostsv4 debian.org >/dev/null 2>&1; then pass "DNS resolves inside the namespace"
+    else flunk "DNS doesn't resolve inside the namespace"; fi
+
+    if "${sandbox[@]}" curl -6s --max-time 5 https://api6.ipify.org >/dev/null 2>&1; then flunk "IPv6 works inside the namespace (should be blocked)"
+    else pass "IPv6 blocked inside the namespace"; fi
+
+    mtu=$(conf_mtu "$CONF")
+    if nsx ping -c1 -W3 -M do -s $((mtu - 28)) "$GW" >/dev/null 2>&1; then pass "MTU $mtu passes unfragmented"
+    else note "MTU probe at $mtu got no reply (only a problem if transfers stall)"; fi
+
+    return $((fails > 0))
+}
+
+cmd_parse() {  # FILE — validate and print non-secret metadata
+    local f=$1 priv addr pub ep natpmp name mtu
+    [[ -r $f ]] || die "can't read $f"
+    priv=$(conf_get "$f" Interface PrivateKey)
+    valid_pub "$priv" || die "no valid PrivateKey in [Interface]"
+    addr=$(conf_addr "$f" || true)
+    [[ $addr =~ ^10\.([0-9]{1,3}\.){2}[0-9]{1,3}/32$ ]] || die "Address isn't a Proton 10.x.x.x/32 address"
+    pub=$(conf_get "$f" Peer PublicKey)
+    valid_pub "$pub" || die "no valid PublicKey in [Peer]"
+    ep=$(conf_get "$f" Peer Endpoint)
+    valid_ep "$ep" || die "Endpoint must be IPv4:port (got '$ep')"
+    natpmp=$(grep -oiP '^#\s*NAT-PMP \(Port Forwarding\)\s*=\s*\K(on|off)' "$f" | tr '[:upper:]' '[:lower:]' || true)
+    name=$(awk '/^\[Peer\]/ { p = 1; next } p && /^#/ { sub(/^#[[:space:]]*/, ""); print; exit } p && /^\[/ { exit }' "$f")
+    mtu=$(conf_mtu "$f")
+    printf 'PEER_NAME=%s\nPEER_PUB=%s\nENDPOINT=%s\nADDRESS=%s\nMTU=%s\nNATPMP=%s\nOWN_PUB=%s\n' \
+        "${name:-unknown}" "$pub" "$ep" "$addr" "$mtu" "${natpmp:-unknown}" "$(printf '%s\n' "$priv" | wg pubkey)"
+}
+
+case ${1:-} in
+    up)         cmd_up ;;
+    down)       cmd_down ;;
+    repair)     cmd_up ;;
+    reload)     cmd_reload ;;
+    setpeer)    cmd_setpeer "${2:?name}" "${3:?pubkey}" "${4:?endpoint}" ;;
+    reconnect)  cmd_reconnect ;;
+    check)      cmd_check ;;
+    check-self) cmd_check_self "${2:-}" ;;
+    doctor)     cmd_doctor ;;
+    parse)      cmd_parse "${2:?file}" ;;
+    *)          echo "usage: pirate-netns up|down|repair|reload|setpeer|reconnect|check|check-self|doctor|parse FILE" >&2; exit 2 ;;
+esac

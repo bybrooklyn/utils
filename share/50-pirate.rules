@@ -1,0 +1,14 @@
+// pirate: let @USER@ start/stop the VPN namespace units without a password.
+// Everything fails closed, so stopping is safe; installing/enabling still needs sudo.
+polkit.addRule(function (action, subject) {
+    if (action.id != "org.freedesktop.systemd1.manage-units" || subject.user != "@USER@")
+        return;
+    var allowed = {
+        "pirate-qbittorrent.service": ["start", "stop", "restart", "reset-failed"],
+        "pirate-vpnd.service": ["start", "stop", "restart", "reload"],
+        "pirate-netns.service": ["start", "stop", "restart"]
+    };
+    var verbs = allowed[action.lookup("unit")];
+    if (verbs && verbs.indexOf(action.lookup("verb")) >= 0)
+        return polkit.Result.YES;
+});

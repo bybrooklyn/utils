@@ -1,0 +1,20 @@
+[Unit]
+Description=pirate: VPN network namespace with Proton WireGuard
+After=local-fs.target systemd-modules-load.service
+Before=pirate-vpnd.service pirate-qbittorrent.service
+ConditionPathExists=/etc/pirate/wg.conf
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=PIRATE_USER=@USER@
+ExecStart=/usr/local/lib/pirate/pirate-netns up
+ExecStop=/usr/local/lib/pirate/pirate-netns down
+TimeoutStartSec=30
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

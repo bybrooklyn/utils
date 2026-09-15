@@ -1,0 +1,834 @@
+#!/usr/bin/env zsh
+# pirate — qBittorrent inside a Proton WireGuard network namespace: only qBittorrent
+# uses the VPN, it can't leak, and the forwarded port is kept in sync.
+# `pirate` sets up / repairs everything; `pirate help` lists the other commands.
+emulate -L zsh
+setopt pipefail extended_glob
+zmodload zsh/datetime zsh/system
+
+PIRATE_BIN=${0:A}                # real path of this script (follows symlinks)
+SRC=${PIRATE_BIN:h:h}/share      # repo layout: bin/pirate + share/
+LIB=/usr/local/lib/pirate
+ETC=/etc/pirate
+RUN=/run/pirate
+NSP=/run/netns/pirate
+CONFIG_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/pirate
+CONFIG=$CONFIG_DIR/config
+STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/pirate
+QBT_CONF=$HOME/.config/qBittorrent/qBittorrent.conf
+QBT_USER=pirate
+PROTON_CACHE=$HOME/.cache/Proton/VPN/serverlist.json
+USER_UNIT=$HOME/.config/systemd/user/pirate-session.service
+DESKTOP_OVERRIDE=$HOME/.local/share/applications/org.qbittorrent.qBittorrent.desktop
+SESSION_ENV=/run/user/$UID/pirate/session.env
+UNITS=(pirate-netns.service pirate-vpnd.service pirate-qbittorrent.service)
+NEED_TESTS=0
+
+autoload -Uz colors && colors
+bold() { print -r -- "${bold_color}$*${reset_color}" }
+ok()   { print -r -- "  ${fg[green]}✓${reset_color} $*" }
+warn() { print -r -- "  ${fg[yellow]}!${reset_color} $*" }
+fail() { print -r -- "  ${fg[red]}✗${reset_color} $*" }
+die()  { fail "$@" >&2; exit 1 }
+rd()   { [[ -r $1 ]] && print -r -- "$(<$1)" }
+meta() { sed -n "s/^$1=//p" $ETC/wg.meta 2>/dev/null | head -1 }
+have_tty() { [[ -t 0 && -t 1 ]] }
+desktop_notify() { timeout 5 notify-send -a pirate -i network-vpn -u ${1:-normal} "$2" "${3:-}" &>/dev/null }
+journal_tail() { journalctl -u pirate-netns -u pirate-vpnd -u pirate-qbittorrent -n ${1:-25} --no-pager -o cat 2>/dev/null | sed 's/^/    /' }
+
+run_sudo() {
+    if sudo -n true 2>/dev/null || have_tty; then
+        sudo "$@"
+    else
+        fail "needs sudo — run 'pirate' in a terminal (skipped: $*)"
+        return 1
+    fi
+}
+
+# systemctl via the polkit rule, falling back to sudo (e.g. before the rule exists)
+unitctl() { systemctl --no-ask-password "$@" 2>/dev/null || run_sudo systemctl "$@" }
+
+# start qBittorrent's unit, clearing an earlier failure / start limit first
+qbt_unit_start() {  # [--no-block]
+    systemctl --no-ask-password reset-failed pirate-qbittorrent.service &>/dev/null
+    systemctl --no-ask-password start "$@" pirate-qbittorrent.service
+}
+
+take_lock() {
+    local err
+    mkdir -p $STATE_DIR
+    : >> $STATE_DIR/lock   # zsystem flock only opens existing files
+    # not in $(…): the lock must be held by this shell, not a subshell
+    zsystem flock -t 0 -f PIRATE_LOCK_FD $STATE_DIR/lock 2>$STATE_DIR/lock.err && return 0
+    err=$(<$STATE_DIR/lock.err)
+    [[ $err == *(temporarily unavailable|timeout)* ]] && die "another 'pirate' is already running"
+    die "couldn't lock $STATE_DIR/lock: $err"
+}
+
+render() {  # fill @USER@ @GROUP@ @UID@ @HOME@ @PIRATE@ placeholders
+    sed -e "s|@USER@|$USER|g" -e "s|@GROUP@|$(id -gn)|g" -e "s|@UID@|$UID|g" -e "s|@HOME@|$HOME|g" \
+        -e "s|@PIRATE@|$PIRATE_BIN|g" $1
+}
+
+# ---------- settings ----------
+
+ensure_config() {
+    mkdir -p -m 700 $CONFIG_DIR
+    [[ -f $CONFIG ]] || cat > $CONFIG <<'EOF'
+# pirate settings — change with `pirate server …`
+COUNTRY=""         # preferred VPN country (e.g. US, NL, CH); empty = the imported config's country
+SERVER=""          # pin one server (e.g. US-NY#486); empty = automatic
+KILL_HOST_QBT="yes" # stop qBittorrent if it's ever started outside the VPN
+FORWARD="bwrap"    # how magnet links reach qBittorrent: bwrap (no network) or plain
+DOWNLOAD_DIR=""    # where qBittorrent saves downloads; empty = ~/Torrents
+EOF
+}
+
+get_config() {
+    sed -nE -e "s/^$1=\"([^\"]*)\".*/\1/p" -e "s/^$1=([^\" ]+).*/\1/p" $CONFIG 2>/dev/null | tail -1
+}
+
+download_dir() {
+    local d=$(get_config DOWNLOAD_DIR)
+    d=${d/#\~/$HOME}
+    print -r -- ${d:-$HOME/Torrents}
+}
+
+set_config() {  # key value
+    ensure_config
+    if grep -q "^$1=" $CONFIG; then
+        sed -i -E "s@^$1=(\"[^\"]*\"|[^ ]*)@$1=\"$2\"@" $CONFIG
+    else
+        print -r -- "$1=\"$2\"" >> $CONFIG
+    fi
+}
+
+# ---------- qBittorrent helpers ----------
+
+qbt_pids() { pgrep -u $UID -x qbittorrent }
+
+host_qbt_pids() {
+    local pid host=$(stat -Lc %i /proc/self/ns/net) out=()
+    for pid in $(qbt_pids); do
+        [[ $(stat -Lc %i /proc/$pid/ns/net 2>/dev/null) == $host ]] && out+=$pid
+    done
+    print -r -- $out
+}
+
+qbt_ns_pid() {  # MainPID of pirate-qbittorrent if it really is inside the namespace
+    local pid=$(systemctl show -p MainPID --value pirate-qbittorrent.service 2>/dev/null)
+    [[ -n $pid && $pid != 0 && -e $NSP ]] || return 1
+    [[ $(stat -Lc %i /proc/$pid/ns/net 2>/dev/null) == $(stat -Lc %i $NSP 2>/dev/null) ]] || return 1
+    print $pid
+}
+
+qbt_ready() {  # namespaced qBittorrent is listening on its single-instance socket
+    local pid
+    pid=$(qbt_ns_pid) || return 1
+    awk -v p="$HOME/.config/qBittorrent/" '$4 == "00010000" && index($8, p) == 1 { f = 1 } END { exit !f }' \
+        /proc/$pid/net/unix 2>/dev/null
+}
+
+wait_qbt() {
+    local i
+    for (( i = 0; i < $1 * 2; i++ )); do
+        qbt_ready && return 0
+        sleep 0.5
+    done
+    return 1
+}
+
+stop_qbt() {
+    local pid i
+    systemctl is-active -q pirate-qbittorrent.service && unitctl stop pirate-qbittorrent.service
+    for pid in $(qbt_pids); do kill -TERM $pid 2>/dev/null; done
+    for (( i = 0; i < 90; i++ )); do
+        [[ -z $(qbt_pids) ]] && return 0
+        sleep 1
+    done
+    return 1
+}
+
+qbt_conf() {  # check|apply — check exits 3 and lists what needs changing
+    python3 - $1 $QBT_CONF "$(download_dir)" $QBT_USER $CONFIG_DIR/webui.pass <<'EOF'
+import base64, hashlib, os, re, sys
+mode, conf, dl, user, passfile = sys.argv[1:6]
+try:
+    pw = open(passfile).read().strip()
+except FileNotFoundError:
+    if mode != "check":
+        raise
+    pw = None
+try:
+    lines = open(conf).read().splitlines()
+except FileNotFoundError:
+    lines = []
+
+def get(section, key):
+    cur = None
+    for l in lines:
+        if l.startswith("[") and l.endswith("]"):
+            cur = l[1:-1]
+        elif cur == section and l.split("=", 1)[0] == key:
+            return l.split("=", 1)[1]
+
+def password_ok(value):
+    m = re.fullmatch(r'"?@ByteArray\(([^:]+):([^)]+)\)"?', value or "")
+    if not m or pw is None:
+        return False
+    salt, want = base64.b64decode(m[1]), base64.b64decode(m[2])
+    return hashlib.pbkdf2_hmac("sha512", pw.encode(), salt, 100000, len(want)) == want
+
+critical = {
+    "BitTorrent": {r"Session\Interface": "wgpirate", r"Session\InterfaceName": "wgpirate"},
+    "Preferences": {r"WebUI\Enabled": "true", r"WebUI\Address": "127.0.0.1", r"WebUI\Port": "8080",
+                    r"WebUI\LocalHostAuth": "false", r"WebUI\Username": user},
+}
+needs = [k for s, kv in critical.items() for k, v in kv.items() if get(s, k) != v]
+if not password_ok(get("Preferences", r"WebUI\Password_PBKDF2")):
+    needs.append("WebUI password")
+if mode == "check":
+    print(", ".join(needs))
+    sys.exit(3 if needs else 0)
+
+want = {s: dict(kv) for s, kv in critical.items()}
+want["BitTorrent"][r"Session\DefaultSavePath"] = dl
+want["Network"] = {"PortForwardingEnabled": "false"}
+if "WebUI password" in needs:
+    salt = os.urandom(16)
+    key = hashlib.pbkdf2_hmac("sha512", pw.encode(), salt, 100000, 64)
+    want["Preferences"][r"WebUI\Password_PBKDF2"] = '"@ByteArray(%s:%s)"' % (
+        base64.b64encode(salt).decode(), base64.b64encode(key).decode())
+
+pending = {s: dict(kv) for s, kv in want.items()}
+out, section = [], None
+def flush():
+    for k, v in pending.pop(section, {}).items():
+        out.append(f"{k}={v}")
+for line in lines:
+    if line.startswith("[") and line.endswith("]"):
+        if section is not None:
+            blank = out and out[-1] == ""
+            if blank: out.pop()
+            flush()
+            if blank: out.append("")
+        section = line[1:-1]
+        out.append(line)
+        continue
+    if section in pending and "=" in line:
+        k = line.split("=", 1)[0]
+        if k in pending[section]:
+            out.append(f"{k}={pending[section].pop(k)}")
+            continue
+    out.append(line)
+if section is not None:
+    flush()
+for s, kv in pending.items():
+    if kv:
+        out += ["", f"[{s}]"] + [f"{k}={v}" for k, v in kv.items()]
+os.makedirs(os.path.dirname(conf), exist_ok=True)
+tmp = conf + ".pirate-tmp"
+open(tmp, "w").write("\n".join(out) + "\n")
+os.replace(tmp, conf)
+EOF
+}
+
+# ---------- session ----------
+
+write_session_env() {  # session variables qBittorrent needs (never SESSION_MANAGER / DISPLAY)
+    local line
+    mkdir -p -m 700 ${SESSION_ENV:h}
+    {
+        for line in ${(f)"$(systemctl --user show-environment 2>/dev/null)"}; do
+            [[ $line == (WAYLAND_DISPLAY|XDG_CURRENT_DESKTOP|XDG_SESSION_DESKTOP|XDG_SESSION_TYPE|XDG_DATA_DIRS|XDG_CONFIG_DIRS|KDE_[A-Z_]##|LANG|LANGUAGE|LC_[A-Z]##|XCURSOR_[A-Z]##|QT_[A-Z_]##|GTK_[A-Z_]##)=* ]] || continue
+            [[ $line == QT_WAYLAND_RECONNECT=* || $line == *[\"\'\\]* ]] && continue
+            print -r -- $line
+        done
+    } > $SESSION_ENV.tmp && mv -f $SESSION_ENV.tmp $SESSION_ENV
+}
+
+cmd_session_start() {
+    write_session_env
+    if [[ ! -e $NSP ]]; then
+        desktop_notify critical "pirate: VPN isn't running" "qBittorrent wasn't started. Run 'pirate' in a terminal."
+        return 0
+    fi
+    qbt_unit_start --no-block
+}
+
+cmd_session_stop() { systemctl --no-ask-password stop pirate-qbittorrent.service }
+
+# Desktop launcher: start/raise the namespaced qBittorrent and hand it the arguments.
+# Never starts a qBittorrent outside the VPN.
+cmd_open() {
+    if [[ ! -e $NSP ]]; then
+        desktop_notify critical "pirate: VPN isn't running" "qBittorrent wasn't started. Run 'pirate' in a terminal."
+        die "the VPN namespace isn't running — run 'pirate'"
+    fi
+    if ! qbt_ready; then
+        write_session_env
+        if ! qbt_unit_start; then
+            desktop_notify critical "pirate: couldn't start qBittorrent" "Run 'pirate' in a terminal."
+            die "couldn't start pirate-qbittorrent.service — run 'pirate'"
+        fi
+        if ! wait_qbt 60; then
+            desktop_notify critical "pirate: qBittorrent didn't start" "See 'pirate logs'."
+            die "qBittorrent didn't start inside the VPN — see 'pirate logs'"
+        fi
+    fi
+    if [[ $(get_config FORWARD) != plain ]] && bwrap --unshare-net --die-with-parent --dev-bind / / true 2>/dev/null; then
+        exec bwrap --unshare-net --die-with-parent --dev-bind / / /usr/bin/qbittorrent "$@"
+    fi
+    exec /usr/bin/qbittorrent "$@"
+}
+
+# ---------- setup steps ----------
+
+step_deps() {
+    local -A pkg=(wg wireguard-tools natpmpc libnatpmp jq jq curl curl nsenter util-linux setpriv util-linux
+                  notify-send libnotify bwrap bubblewrap qbittorrent qbittorrent python3 python
+                  kwriteconfig6 kconfig update-desktop-database desktop-file-utils)
+    local cmd missing=()
+    for cmd in ${(k)pkg}; do (( $+commands[$cmd] )) || missing+=$pkg[$cmd]; done
+    if (( $#missing )); then
+        bold "Installing missing packages: ${(u)missing}"
+        run_sudo pacman -S --needed --noconfirm ${(u)missing} || die "package install failed"
+    fi
+    modinfo wireguard &>/dev/null || die "the wireguard kernel module is missing"
+    ok "dependencies installed"
+}
+
+find_download() {
+    local f
+    for f in $HOME/Downloads/*.conf(N.om); do
+        grep -q '^\[Peer\]' $f && grep -q '^PrivateKey' $f && grep -q '10\.2\.0\.2' $f && { print -r -- $f; return 0 }
+    done
+    return 1
+}
+
+import_config() {  # file force
+    local src=$1 force=$2 parsed natpmp pub ep name cc tmp reply=y
+    parsed=$(bash $SRC/pirate-netns parse $src 2>&1) || die "${src:t}: ${parsed#pirate-netns: }"
+    natpmp=${${(M)${(f)parsed}:#NATPMP=*}#NATPMP=}
+    pub=${${(M)${(f)parsed}:#PEER_PUB=*}#PEER_PUB=}
+    ep=${${(M)${(f)parsed}:#ENDPOINT=*}#ENDPOINT=}
+    name=${${(M)${(f)parsed}:#PEER_NAME=*}#PEER_NAME=}
+    case $natpmp in
+        on) ;;
+        off) (( force )) || die "${src:t} has NAT-PMP (port forwarding) OFF — create a config with it on (or use --force)" ;;
+        *) warn "can't tell whether ${src:t} has NAT-PMP on (no '# NAT-PMP' comment)" ;;
+    esac
+    cc=$(jq -r --arg p $pub --arg ip ${ep%:*} \
+        'first(.LogicalServers[] | . as $l | .Servers[] | select(.X25519PublicKey == $p and .EntryIP == $ip) | $l.ExitCountry) // empty' \
+        $PROTON_CACHE 2>/dev/null)
+    [[ -n $cc ]] || cc=${name[1,2]}
+    [[ $cc == [A-Z][A-Z] ]] || cc=""
+    jq -e --arg p $pub --arg ip ${ep%:*} \
+        'any(.LogicalServers[] | select(((.Features / 4 | floor) % 2) == 1) | .Servers[]; .X25519PublicKey == $p and .EntryIP == $ip)' \
+        $PROTON_CACHE &>/dev/null || warn "$name isn't a known P2P server — port forwarding only works on P2P servers"
+
+    tmp=$(mktemp)
+    { print -r -- $parsed; print "COUNTRY=$cc"; print "IMPORTED=$(date +%F)"; print "SOURCE=${src:t}" } > $tmp
+    bold "Installing WireGuard config ($name) — sudo"
+    if ! run_sudo install -d -m755 -o root -g root $ETC ||
+       ! run_sudo install -m600 -o root -g root $src $ETC/wg.conf ||
+       ! run_sudo install -m644 -o root -g root $tmp $ETC/wg.meta; then
+        rm -f $tmp
+        die "couldn't install the config"
+    fi
+    rm -f $tmp
+    rm -f $STATE_DIR/tests-passed
+    NEED_TESTS=1
+    ok "config installed as $ETC/wg.conf (readable by root only)"
+    if [[ $src == $HOME/Downloads/* ]]; then
+        have_tty && { read -k 1 "reply?  Delete the downloaded copy (it contains your private key)? [Y/n] "; print }
+        if [[ $reply == [nN] ]]; then
+            chmod 600 $src
+            warn "kept ${src:t} (now readable only by you)"
+        else
+            rm -f $src
+            ok "deleted ${src:t} from Downloads"
+        fi
+    fi
+    if systemctl is-active -q pirate-netns.service; then
+        run_sudo $LIB/pirate-netns reload && unitctl restart pirate-vpnd.service && ok "tunnel switched to the new config"
+    fi
+}
+
+step_config() {  # [file] force
+    local src=$1
+    if [[ -z $src && -r $ETC/wg.meta ]]; then
+        ok "WireGuard config: $(meta PEER_NAME), imported $(meta IMPORTED)"
+        return 0
+    fi
+    if [[ -z $src ]] && ! src=$(find_download); then
+        fail "no Proton WireGuard config found"
+        cat <<'EOF'
+    1. Open https://account.protonvpn.com/downloads → WireGuard configuration
+    2. Platform Linux · NetShield off · Moderate NAT off · NAT-PMP (Port Forwarding) ON
+    3. Pick a P2P server (double-arrow icon), Create, then Download
+    4. Run: pirate
+EOF
+        xdg-open https://account.protonvpn.com/downloads &>/dev/null &!
+        exit 2
+    fi
+    import_config $src $2
+}
+
+build_servers() {
+    [[ -r $PROTON_CACHE ]] || return 1
+    jq --arg date "$(date -r $PROTON_CACHE +%F)" '
+        (.MaxTier // 2) as $t
+        | { snapshot_date: $date,
+            servers: ([ .LogicalServers[]
+                | select(.Status == 1 and .Tier <= $t and (.Features % 8) >= 4
+                         and (.Features % 2) == 0 and ((.Features / 2 | floor) % 2) == 0)
+                | . as $l | .Servers[]
+                | select(.Status == 1 and (.X25519PublicKey // "") != "" and (.EntryIP // "") != "")
+                | { n: $l.Name, cc: $l.ExitCountry, city: $l.City, score: $l.Score, ip: .EntryIP, pub: .X25519PublicKey } ]
+              | group_by(.ip + .pub) | map(min_by(.score)) | sort_by(.score)) }' $PROTON_CACHE
+}
+
+step_servers() {
+    local tmp=$(mktemp) n=0
+    if build_servers > $tmp && (( (n = $(jq '.servers | length' $tmp)) > 0 )); then
+        if ! cmp -s $tmp $ETC/servers.json; then
+            run_sudo install -m644 -o root -g root $tmp $ETC/servers.json || { rm -f $tmp; die "couldn't install the server list" }
+        fi
+        ok "server list: $n P2P servers (Proton data from $(jq -r .snapshot_date $tmp))"
+    elif [[ -r $ETC/servers.json ]]; then
+        warn "Proton's server cache is unavailable — keeping the existing server list"
+    else
+        print '{"snapshot_date":"none","servers":[]}' > $tmp
+        run_sudo install -m644 -o root -g root $tmp $ETC/servers.json
+        warn "no Proton server cache — automatic server switching is disabled"
+    fi
+    rm -f $tmp
+}
+
+step_cleanup_old() {
+    local marker=$STATE_DIR/cleanup-v2-done settings=$HOME/.config/Proton/VPN/settings.json
+    [[ -f $marker ]] && return 0
+    bold "Removing the old Proton-CLI setup"
+    if [[ -f /etc/systemd/system/pirate-vpn.service ]]; then
+        run_sudo systemctl disable --now pirate-vpn.service
+        run_sudo rm -f /etc/systemd/system/pirate-vpn.service || return 1
+        run_sudo systemctl daemon-reload
+        run_sudo systemctl reset-failed pirate-vpn.service &>/dev/null
+    fi
+    run_sudo rm -f /etc/polkit-1/rules.d/49-pirate-networkmanager.rules || return 1
+    rm -f $HOME/.config/environment.d/proton-keyring.conf
+    systemctl --user unset-environment PROTON_LOADER_OVERRIDES &>/dev/null
+    [[ $(rd $HOME/.config/Proton/keyring-proton-sso-accounts.json) == '[]' ]] &&
+        rm -f $HOME/.config/Proton/keyring-proton-sso-accounts.json
+    if [[ -f $settings.bak-pre-natpmpc ]] && ! pgrep -f 'proton\.vpn\.app\.gtk|/usr/bin/protonvpn-app' >/dev/null; then
+        mv -f $settings.bak-pre-natpmpc $settings
+    fi
+    rm -f $HOME/.local/bin/pirate-vpn $HOME/.local/bin/proton-qbt-pf
+    rm -f $STATE_DIR/{status,port,ip,server,daemon,polkit.sha,qbt-cookies,signed-out-on-purpose}(N)
+    rm -rf $HOME/.config/Proton/.pirate-login-backup
+    [[ -f $CONFIG ]] && grep -q '^PVPN_COUNTRY=' $CONFIG && rm -f $CONFIG
+    mkdir -p $STATE_DIR && touch $marker
+    ok "removed the old service, NetworkManager rule and Proton keyring override; restored Proton app settings"
+}
+
+step_install() {
+    local stage=$(mktemp -d) f u changed=()
+    local -A modes=(usr/local/lib/pirate/pirate-netns 755 usr/local/lib/pirate/pirate-vpnd 755)
+    mkdir -p $stage/usr/local/lib/pirate $stage/etc/systemd/system $stage/etc/polkit-1/rules.d \
+             $stage/etc/pirate/resolve $stage/etc/netns/pirate
+    cp $SRC/pirate-netns $SRC/pirate-vpnd $stage/usr/local/lib/pirate/
+    for u in $UNITS; do render $SRC/$u > $stage/etc/systemd/system/$u; done
+    render $SRC/50-pirate.rules > $stage/etc/polkit-1/rules.d/50-pirate.rules
+    for f in etc/pirate/resolve/resolv.conf etc/pirate/resolve/stub-resolv.conf etc/netns/pirate/resolv.conf; do
+        print 'nameserver 10.2.0.1' > $stage/$f
+    done
+    for f in etc/pirate/nsswitch.conf etc/netns/pirate/nsswitch.conf; do
+        sed -E 's/^hosts:.*/hosts: files myhostname dns/' /etc/nsswitch.conf > $stage/$f
+    done
+    for f in ${(f)"$(cd $stage && find . -type f | sed 's|^\./||' | sort)"}; do
+        if [[ -r /$f ]]; then
+            cmp -s $stage/$f /$f || changed+=$f
+        else  # e.g. the polkit rules dir isn't readable by users
+            grep -qxF "$(sha256sum < $stage/$f | cut -d' ' -f1) /$f" $ETC/manifest.sha256 2>/dev/null || changed+=$f
+        fi
+    done
+    if (( $#changed )); then
+        bold "Installing $#changed system file(s) — sudo"
+        for f in $changed; do
+            run_sudo install -D -m ${modes[$f]:-644} -o root -g root $stage/$f /$f || { rm -rf $stage; die "couldn't install /$f" }
+        done
+        (cd $stage && for f in ${(f)"$(find . -type f | sed 's|^\./||' | sort)"}; do
+            print -r -- "$(sha256sum < $f | cut -d' ' -f1) /$f"
+        done) > $stage.manifest
+        run_sudo install -m644 -o root -g root $stage.manifest $ETC/manifest.sha256
+        run_sudo systemctl daemon-reload
+        if [[ -n ${(M)changed:#(usr/local/lib/pirate/pirate-vpnd|etc/systemd/system/pirate-vpnd.service)} ]] &&
+           systemctl is-active -q pirate-vpnd.service; then
+            run_sudo systemctl restart pirate-vpnd.service
+        fi
+        rm -f $STATE_DIR/tests-passed
+        NEED_TESTS=1
+    fi
+    rm -rf $stage $stage.manifest
+    ok "system files up to date"
+}
+
+wait_status() {  # state timeout-seconds — 0 reached, 2 expired/degraded, 1 timeout
+    local want=$1 st last=- i
+    for (( i = 0; i < $2; i += 2 )); do
+        st=$(rd $RUN/status)
+        if [[ $st != $last ]]; then
+            print -r -- "    … ${st:-starting}${st:+ — $(rd $RUN/detail)}"
+            last=$st
+        fi
+        [[ $st == $want ]] && return 0
+        [[ $st == (expired|degraded) ]] && return 2
+        sleep 2
+    done
+    return 1
+}
+
+step_tunnel() {
+    local u started=0
+    for u in pirate-netns.service pirate-vpnd.service; do
+        systemctl is-enabled -q $u || run_sudo systemctl enable -q $u || return 1
+    done
+    if ! systemctl is-active -q pirate-netns.service || ! systemctl is-active -q pirate-vpnd.service; then
+        bold "Starting the VPN namespace"
+        unitctl start pirate-netns.service pirate-vpnd.service || { journal_tail; return 1 }
+        started=1
+    fi
+    ok "VPN namespace and pirate-vpnd running (start at boot)"
+    if [[ $(rd $RUN/status) != connected ]]; then
+        bold "Waiting for the VPN and port forward"
+        wait_status connected 150
+        case $? in
+            0) ;;
+            2) fail "$(rd $RUN/detail)"; return 1 ;;
+            *) fail "VPN didn't connect: $(rd $RUN/detail)"; journal_tail; return 1 ;;
+        esac
+    fi
+    ok "connected: $(rd $RUN/detail)"
+    if (( started || NEED_TESTS )) || [[ ! -f $STATE_DIR/tests-passed ]]; then
+        bold "Testing for leaks (namespace, DNS, IPv6, split tunnel) — sudo"
+        run_sudo $LIB/pirate-netns doctor || { fail "leak tests failed — qBittorrent was left untouched"; return 1 }
+        touch $STATE_DIR/tests-passed
+    fi
+}
+
+step_qbt() {
+    local needs rc hosts
+    ensure_config
+    mkdir -p "$(download_dir)"
+    [[ -s $CONFIG_DIR/webui.pass ]] || (umask 077; head -c 24 /dev/urandom | base64 | tr -d '\n' > $CONFIG_DIR/webui.pass)
+    needs=$(qbt_conf check); rc=$?
+    (( rc == 0 || rc == 3 )) || die "couldn't read $QBT_CONF"
+    hosts=$(host_qbt_pids)
+    if [[ -n $needs || -n $hosts ]]; then
+        bold "Moving qBittorrent into the VPN namespace"
+        if [[ -n $(qbt_pids) ]]; then
+            print -r -- "    closing qBittorrent (it saves its torrents first)…"
+            stop_qbt || { fail "qBittorrent didn't quit — close it yourself and run pirate again"; return 1 }
+        fi
+    fi
+    if [[ -n $needs ]]; then
+        [[ -f $QBT_CONF.bak-pirate-v3 || ! -f $QBT_CONF ]] || cp -p $QBT_CONF $QBT_CONF.bak-pirate-v3
+        qbt_conf apply || die "couldn't write $QBT_CONF"
+        ok "qBittorrent settings: bound to wgpirate, WebUI login set, saves to $(download_dir)"
+    else
+        ok "qBittorrent settings OK"
+    fi
+}
+
+step_desktop() {
+    local sys=/usr/share/applications/org.qbittorrent.qBittorrent.desktop tmp ex
+    mkdir -p ${DESKTOP_OVERRIDE:h} ${USER_UNIT:h}
+    tmp=$(mktemp)
+    sed -E -e "s|^Exec=.*|Exec=$PIRATE_BIN open %U|" -e '/^(TryExec|DBusActivatable)=/d' $sys > $tmp
+    if cmp -s $tmp $DESKTOP_OVERRIDE; then
+        rm -f $tmp
+    else
+        mv -f $tmp $DESKTOP_OVERRIDE
+        update-desktop-database ${DESKTOP_OVERRIDE:h} &>/dev/null
+        kbuildsycoca6 &>/dev/null
+    fi
+    ok "app menu and magnet links open qBittorrent inside the VPN"
+    rm -f $HOME/.config/autostart/qbittorrent.desktop
+
+    tmp=$(mktemp)
+    render $SRC/pirate-session.service > $tmp
+    if cmp -s $tmp $USER_UNIT; then
+        rm -f $tmp
+    else
+        mv -f $tmp $USER_UNIT
+        systemctl --user daemon-reload
+    fi
+    systemctl --user is-enabled -q pirate-session.service || systemctl --user enable -q pirate-session.service
+    ok "qBittorrent starts inside the VPN when you log in"
+
+    ex=$(kreadconfig6 --file ksmserverrc --group General --key excludeApps)
+    [[ ,$ex, == *,qbittorrent,* ]] ||
+        kwriteconfig6 --file ksmserverrc --group General --key excludeApps "${ex:+$ex,}qbittorrent"
+    ok "KDE won't restore qBittorrent outside the VPN at login"
+
+    if bwrap --unshare-net --dev-bind / / true 2>/dev/null; then set_config FORWARD bwrap; else set_config FORWARD plain; fi
+}
+
+step_finish() {
+    if [[ -n ${WAYLAND_DISPLAY:-} && -S /run/user/$UID/${WAYLAND_DISPLAY:-} ]]; then
+        bold "Starting qBittorrent inside the VPN"
+        systemctl --user start pirate-session.service
+        qbt_ready || { write_session_env; qbt_unit_start || run_sudo systemctl start pirate-qbittorrent.service }
+        if wait_qbt 60; then
+            ok "qBittorrent is running inside the VPN namespace"
+        else
+            fail "qBittorrent didn't start — recent log:"
+            journal_tail 15
+        fi
+        local i
+        for (( i = 0; i < 30; i++ )); do
+            [[ $(rd $RUN/qbt) == (connected|firewalled) ]] && break
+            sleep 1
+        done
+    else
+        warn "no desktop session here — qBittorrent will start when you log in"
+    fi
+    print
+    cmd_status
+}
+
+cmd_setup() {
+    local force=0 file="" a
+    for a in "$@"; do
+        case $a in
+            --force) force=1 ;;
+            *) file=${a:A} ;;
+        esac
+    done
+    [[ -z $file || -r $file ]] || die "can't read $file"
+    take_lock
+    bold "pirate setup"
+    step_deps
+    step_config "$file" $force
+    ensure_config
+    step_servers
+    step_cleanup_old || die "couldn't remove the old setup"
+    step_install
+    step_tunnel || exit 1
+    step_qbt || exit 1
+    step_desktop
+    step_finish
+}
+
+# ---------- everyday commands ----------
+
+cmd_status() {
+    bold "pirate status"
+    local healthy=1 st detail upd hs pid ifs qbt_st hosts imported days
+    if [[ ! -r $ETC/wg.meta ]]; then
+        fail "not set up — run 'pirate'"
+        return 1
+    fi
+    local netns=$(systemctl is-active pirate-netns.service 2>/dev/null)
+    local vpnd=$(systemctl is-active pirate-vpnd.service 2>/dev/null)
+    if [[ $netns == active ]]; then ok "VPN namespace up (starts at boot)"
+    else fail "VPN namespace ${netns:-inactive} — run 'pirate start'"; healthy=0; fi
+
+    if [[ $vpnd == active ]]; then
+        st=$(rd $RUN/status) detail=$(rd $RUN/detail) upd=$(rd $RUN/updated) hs=$(rd $RUN/handshake)
+        (( EPOCHSECONDS - ${upd:-0} < 60 )) || { fail "pirate-vpnd stopped updating its status (hung?)"; healthy=0 }
+        if [[ $st == connected ]]; then ok "VPN: $detail"
+        else fail "VPN: ${st:-starting} — $detail"; healthy=0; fi
+        (( ${hs:-0} > 0 )) && ok "last WireGuard handshake $(( EPOCHSECONDS - hs ))s ago"
+    else
+        fail "pirate-vpnd ${vpnd:-inactive} — run 'pirate start'"
+        healthy=0
+    fi
+
+    if pid=$(qbt_ns_pid); then
+        ifs=$(awk 'NR > 2 { sub(":", "", $1); print $1 }' /proc/$pid/net/dev | sort | tr '\n' ' ')
+        if [[ $ifs == "lo wgpirate " ]]; then ok "qBittorrent running inside the VPN (its only interfaces: lo, wgpirate)"
+        else fail "qBittorrent's namespace has unexpected interfaces: $ifs"; healthy=0; fi
+        qbt_st=$(rd $RUN/qbt)
+        case $qbt_st in
+            connected)    ok "qBittorrent listening on forwarded port $(rd $RUN/port), incoming peers OK" ;;
+            firewalled)   ok "qBittorrent listening on forwarded port $(rd $RUN/port) (no incoming peers yet — normal at first)" ;;
+            disconnected) warn "qBittorrent isn't listening yet (pirate-vpnd makes it rebind)" ;;
+            offline)      warn "qBittorrent's WebUI isn't answering yet, so its port can't be set" ;;
+        esac
+    else
+        hosts=$(host_qbt_pids)
+        if [[ -n $hosts ]]; then fail "qBittorrent is running OUTSIDE the VPN (pid $hosts) — pirate-vpnd will stop it"; healthy=0
+        else warn "qBittorrent isn't running — open it from the app menu or run 'pirate open'"; fi
+    fi
+
+    imported=$(meta IMPORTED)
+    if [[ -n $imported ]]; then
+        days=$(( ( $(date -d "$imported + 1 year" +%s) - EPOCHSECONDS ) / 86400 ))
+        if (( days > 30 )); then ok "WireGuard config from $(meta PEER_NAME), imported $imported"
+        else warn "WireGuard config imported $imported — Proton configs expire after about a year: use Extend in the Proton dashboard (or download a new one) and run 'pirate config <file>'"; fi
+    fi
+    [[ -e /sys/class/net/proton0 ]] && warn "the Proton VPN app is connected too — disconnect it, it can block pirate's tunnel"
+    (( healthy ))
+}
+
+cmd_doctor() {
+    local problems=0 ex
+    cmd_status || problems=1
+    print
+    bold "pirate doctor"
+    check() { if eval "$2" &>/dev/null; then ok $1; else fail "$1${3:+ — $3}"; problems=$((problems + 1)); fi }
+    check "services enabled at boot" "systemctl is-enabled -q pirate-netns.service pirate-vpnd.service" "run 'pirate'"
+    check "login unit enabled" "systemctl --user is-enabled -q pirate-session.service" "run 'pirate'"
+    check "qBittorrent settings (wgpirate binding, WebUI login)" "qbt_conf check" "run 'pirate'"
+    check "app menu entry goes through pirate" "grep -q '^Exec=.*pirate open' $DESKTOP_OVERRIDE" "run 'pirate'"
+    check "KDE session restore excludes qBittorrent" "[[ ,\$(kreadconfig6 --file ksmserverrc --group General --key excludeApps), == *,qbittorrent,* ]]" "run 'pirate'"
+    check "no qBittorrent outside the VPN" "[[ -z \$(host_qbt_pids) ]]" "close it and use 'pirate open'"
+    check "Proton VPN app not connected" "[[ ! -e /sys/class/net/proton0 ]]" "disconnect it"
+    print
+    bold "Leak tests (sudo)"
+    run_sudo $LIB/pirate-netns doctor || problems=$((problems + 1))
+    print
+    (( problems == 0 )) && ok "no problems found" || warn "problems found — most are fixed by running 'pirate'"
+    (( problems == 0 ))
+}
+
+reload_daemon() { systemctl --no-ask-password reload pirate-vpnd.service 2>/dev/null || true }
+
+cmd_server() {
+    local arg=${(U)1}
+    [[ -r $ETC/servers.json ]] || die "not set up — run 'pirate'"
+    case $arg in
+        "")
+            print -r -- "current server: $(rd $RUN/server) · preference: country=$(get_config COUNTRY) server=$(get_config SERVER)" \
+                | sed 's/=\( \|$\)/=auto\1/g'
+            return ;;
+        LIST)
+            jq -r --arg cc "${(U)2}" '.servers | map(select($cc == "" or .cc == $cc)) | .[0:15][]
+                | "  \(.n)\t\(.city), \(.cc)"' $ETC/servers.json | column -t -s $'\t'
+            return ;;
+        AUTO)
+            set_config SERVER ""
+            set_config COUNTRY "" ;;
+        [A-Z][A-Z])
+            jq -e --arg c $arg 'any(.servers[]; .cc == $c)' $ETC/servers.json >/dev/null || die "no P2P servers in $arg"
+            set_config SERVER ""
+            set_config COUNTRY $arg ;;
+        [A-Z][A-Z](-[A-Z][A-Z]|)\#<->)
+            jq -e --arg n $arg 'any(.servers[]; .n == $n)' $ETC/servers.json >/dev/null ||
+                die "$arg isn't in pirate's server list (try 'pirate server list ${arg[1,2]}')"
+            set_config SERVER $arg ;;
+        *) die "usage: pirate server [CC | NAME | auto | list [CC]]" ;;
+    esac
+    ok "server preference saved"
+    reload_daemon
+    sleep 4
+    wait_status connected 120 && ok "connected: $(rd $RUN/detail)"
+}
+
+cmd_reconnect() {
+    systemctl is-active -q pirate-vpnd.service || die "pirate-vpnd isn't running — run 'pirate start'"
+    mkdir -p $STATE_DIR
+    print -r -- "reconnect $EPOCHSECONDS" > $STATE_DIR/request
+    reload_daemon
+    ok "reconnecting"
+    sleep 4
+    wait_status connected 120 && ok "connected: $(rd $RUN/detail)"
+}
+
+cmd_config() {
+    local force=0 file="" a
+    for a in "$@"; do case $a in --force) force=1 ;; *) file=${a:A} ;; esac; done
+    [[ -n $file && -r $file ]] || die "usage: pirate config <wireguard.conf> [--force]"
+    take_lock
+    import_config $file $force
+    systemctl is-active -q pirate-vpnd.service && { sleep 4; wait_status connected 120 && ok "connected: $(rd $RUN/detail)" }
+}
+
+cmd_start() {
+    unitctl start pirate-netns.service pirate-vpnd.service || die "couldn't start the VPN"
+    ok "VPN namespace started"
+    [[ -n ${WAYLAND_DISPLAY:-} ]] && { write_session_env; qbt_unit_start && ok "qBittorrent started" }
+    wait_status connected 120 && ok "connected: $(rd $RUN/detail)"
+}
+
+cmd_stop() {
+    unitctl stop pirate-qbittorrent.service pirate-vpnd.service pirate-netns.service || die "couldn't stop"
+    ok "stopped qBittorrent and the VPN (they start again at boot, or with 'pirate start')"
+}
+
+cmd_restart() {
+    if [[ ${1:-} == --hard ]]; then
+        unitctl stop pirate-qbittorrent.service
+        unitctl restart pirate-netns.service && unitctl restart pirate-vpnd.service || die "restart failed"
+        [[ -n ${WAYLAND_DISPLAY:-} ]] && { write_session_env; qbt_unit_start }
+    else
+        unitctl restart pirate-vpnd.service || die "restart failed"
+    fi
+    ok "restarted"
+    sleep 3
+    wait_status connected 120 && ok "connected: $(rd $RUN/detail)"
+}
+
+cmd_uninstall() {
+    local reply=n f
+    have_tty || die "run 'pirate uninstall' in a terminal"
+    read -k 1 "reply?Remove pirate (services, namespace, app-menu override)? [y/N] "; print
+    [[ $reply == [yY] ]] || return 1
+    take_lock
+    systemctl --user disable --now pirate-session.service &>/dev/null
+    run_sudo systemctl disable --now pirate-qbittorrent.service pirate-vpnd.service pirate-netns.service
+    run_sudo rm -rf $LIB $ETC /etc/netns/pirate /var/lib/pirate /etc/polkit-1/rules.d/50-pirate.rules \
+        /etc/systemd/system/pirate-{netns,vpnd,qbittorrent}.service
+    run_sudo systemctl daemon-reload
+    rm -f $USER_UNIT $DESKTOP_OVERRIDE $STATE_DIR/{tests-passed,request}(N)
+    systemctl --user daemon-reload
+    update-desktop-database ${DESKTOP_OVERRIDE:h} &>/dev/null
+    kbuildsycoca6 &>/dev/null
+    local ex=$(kreadconfig6 --file ksmserverrc --group General --key excludeApps)
+    kwriteconfig6 --file ksmserverrc --group General --key excludeApps "${${(j:,:)${(s:,:)ex}:#qbittorrent}}"
+    ok "pirate removed (your WireGuard config was in $ETC and is gone — download a new one to reinstall)"
+    if [[ -f $QBT_CONF.bak-pirate-v3 ]]; then
+        read -k 1 "reply?Restore qBittorrent's settings from before pirate? [y/N] "; print
+        [[ $reply == [yY] ]] && stop_qbt && cp -p $QBT_CONF.bak-pirate-v3 $QBT_CONF && ok "qBittorrent settings restored"
+    fi
+}
+
+usage() {
+    cat <<'EOF'
+usage: pirate [command]
+
+  (none) / setup [FILE]   set up or repair everything (imports a WireGuard .conf from
+                          ~/Downloads or FILE; --force allows NAT-PMP off)
+  status                  VPN, port forwarding and qBittorrent health
+  doctor                  status + full leak tests (sudo)
+  open [magnet/torrent]   open qBittorrent inside the VPN (what the app menu uses)
+  server [CC|NAME|auto]   prefer a country (NL, CH, …) or pin a server; `server list [CC]`
+  reconnect               fresh handshake with the current server
+  config FILE             install a new/renewed Proton WireGuard config (sudo)
+  start | stop | restart [--hard]   control the VPN services
+  logs                    follow the pirate logs
+  uninstall               remove pirate
+EOF
+}
+
+case ${1:-setup} in
+    setup|up)       shift $(( $# > 0 )); cmd_setup "$@" ;;
+    status)         cmd_status ;;
+    doctor)         cmd_doctor ;;
+    open)           shift; cmd_open "$@" ;;
+    server)         shift; cmd_server "$@" ;;
+    reconnect)      cmd_reconnect ;;
+    config)         shift; cmd_config "$@" ;;
+    start)          cmd_start ;;
+    stop)           cmd_stop ;;
+    restart)        shift; cmd_restart "$@" ;;
+    logs)           journalctl -u pirate-netns -u pirate-vpnd -u pirate-qbittorrent -f -o short-iso ;;
+    uninstall)      cmd_uninstall ;;
+    session-start)  cmd_session_start ;;
+    session-stop)   cmd_session_stop ;;
+    help|-h|--help) usage ;;
+    *.conf)         cmd_setup "$@" ;;
+    *)              usage; exit 1 ;;
+esac
