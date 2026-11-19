@@ -1,0 +1,64 @@
+# Enable Powerlevel10k instant prompt. Should stay close to the top of ~/.zshrc.
+# Initialization code that may require console input (password prompts, [y/n]
+# confirmations, etc.) must go above this block; everything else may go below.
+if [[ -r "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh" ]]; then
+  source "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh"
+fi
+ZSH_THEME=""
+source /usr/share/cachyos-zsh-config/cachyos-config.zsh
+
+# To customize prompt, run `p10k configure` or edit ~/.p10k.zsh.
+[[ ! -f ~/.p10k.zsh ]] || source ~/.p10k.zsh
+
+# bun completions
+[ -s "/home/brook/.bun/_bun" ] && source "/home/brook/.bun/_bun"
+
+# bun
+export BUN_INSTALL="$HOME/.bun"
+export PATH="$BUN_INSTALL/bin:$PATH"
+
+# >>> forge initialize >>>
+# !! Contents within this block are managed by 'forge zsh setup' !!
+# !! Do not edit manually - changes will be overwritten !!
+
+# Add required zsh plugins if not already present
+#if [[ ! " ${plugins[@]} " =~ " zsh-autosuggestions " ]]; then
+#    plugins+=(zsh-autosuggestions)
+#fi
+#if [[ ! " ${plugins[@]} " =~ " zsh-syntax-highlighting " ]]; then
+#    plugins+=(zsh-syntax-highlighting)
+#fi
+
+# Load forge shell plugin (commands, completions, keybindings) if not already loaded
+#if [[ -z "$_FORGE_PLUGIN_LOADED" ]]; then
+#    eval "$(forge zsh plugin)"
+#fi
+
+# Load forge shell theme (prompt with AI context) if not already loaded
+#if [[ -z "$_FORGE_THEME_LOADED" ]]; then
+#    eval "$(forge zsh theme)"
+#fi
+# <<< forge initialize <<<
+#export PATH="$HOME/.npm-global/bin:$PATH"
+#export PATH="$HOME/.local/bin:$PATH"
+#alias killdict='systemctl --user stop ydotoold.service; pkill -f ydotool; pkill -f dictation_app.py; pkill -f parakeet'
+
+export PATH="$HOME/.local/bin:$PATH"
+
+# >>> Codex installer >>>
+export PATH="/home/brook/.local/bin:$PATH"
+# <<< Codex installer <<<
+export LD_LIBRARY_PATH=$HOME/.local/lib:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH="$HOME/.local/lib:$LD_LIBRARY_PATH"
+export PATH="$HOME/.local/bin:$PATH"
+
+# >>> termium >>>
+case ":$PATH:" in *:'/home/brook/.local/bin':*) ;; *) export PATH='/home/brook/.local/bin':"$PATH" ;; esac
+# <<< termium <<<
+
+# opencode
+export PATH=/home/brook/.opencode/bin:$PATH
+
+# Android SDK/NDK for BoxOfFizz (Quest builds with cargo-ndk)
+export ANDROID_HOME="$HOME/Android/Sdk"
+export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/29.0.14206865"
