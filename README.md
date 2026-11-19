@@ -2,7 +2,7 @@ General stuff I use every day on my PC and my home server. Each folder is its ow
 
 | Folder | What it is |
 |---|---|
-| [pirate](pirate/) | qBittorrent inside a Proton VPN tunnel, and nothing else on the VPN. Port forwarding, server failover, no leaks. |
+| [pirate](pirate/) | qBittorrent inside a Proton VPN tunnel, and nothing else on the VPN. Port forwarding, server failover, no leaks, on Arch, Debian, Ubuntu or Fedora. |
 | [vfios](vfios/) | Keeps every Cloudflare DNS record that points at home on your home's current IP, across all your domains. |
 | [quest-wireless-adb](quest-wireless-adb/) | Turns wireless adb back on every time a Meta Quest reboots. |
 | [dotfiles](dotfiles/) | My zsh setup and prompt, plus btop, fastfetch and micro configs. |
