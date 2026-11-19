@@ -10,6 +10,8 @@
 #   check-self [--no-gui]   verify the calling process is correctly sandboxed
 #   doctor                  full leak/health test report (root)
 #   parse FILE              validate a Proton WireGuard .conf, print metadata (any user)
+#   servers FILE            Proton's server cache → pirate's P2P server list as JSON (any user)
+#   servers-install FILE    rebuild /etc/pirate/servers.json from Proton's cache (root)
 set -euo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/bin
 
@@ -216,6 +218,43 @@ cmd_parse() {  # FILE — validate and print non-secret metadata
         "${name:-unknown}" "$pub" "$ep" "$addr" "$mtu" "${natpmp:-unknown}" "$(printf '%s\n' "$priv" | wg pubkey)"
 }
 
+# Proton's server cache → pirate's list of P2P servers (no Secure Core or Tor, one entry per
+# physical server, best score first). Keys, IPs and names are checked here because root later
+# hands them to `wg`.
+cmd_servers() {  # FILE — print the list as JSON (any user)
+    local f=$1
+    [[ -r $f ]] || die "can't read $f"
+    jq --arg date "$(date -r "$f" +%F)" '
+        (.MaxTier // 2) as $t
+        | { snapshot_date: $date,
+            servers: ([ .LogicalServers[]
+                | select(.Status == 1 and .Tier <= $t and (.Features % 8) >= 4
+                         and (.Features % 2) == 0 and ((.Features / 2 | floor) % 2) == 0)
+                | select((.Name // "") | test("^[A-Z]{2}(-[A-Z]{2})?#[0-9]+$"))
+                | . as $l | .Servers[]
+                | select(.Status == 1
+                         and ((.X25519PublicKey // "") | test("^[A-Za-z0-9+/]{43}=$"))
+                         and ((.EntryIP // "") | test("^([0-9]{1,3}\\.){3}[0-9]{1,3}$")))
+                | { n: $l.Name, cc: $l.ExitCountry, city: $l.City, score: $l.Score, ip: .EntryIP, pub: .X25519PublicKey } ]
+              | group_by(.ip + .pub) | map(min_by(.score)) | sort_by(.score)) }' "$f"
+}
+
+cmd_servers_install() {  # FILE — rebuild /etc/pirate/servers.json from it if that changes anything (root)
+    local tmp n
+    tmp=$(mktemp)
+    if ! cmd_servers "$1" >"$tmp" || ! n=$(jq '.servers | length' "$tmp") || ((n == 0)); then
+        rm -f "$tmp"
+        die "no usable P2P servers in $1, keeping the current list"
+    fi
+    if cmp -s "$tmp" "$ETC/servers.json"; then
+        echo "server list unchanged ($n servers, Proton data from $(jq -r .snapshot_date "$tmp"))"
+    else
+        install -m644 -o root -g root "$tmp" "$ETC/servers.json"
+        echo "server list updated: $n servers, Proton data from $(jq -r .snapshot_date "$tmp")"
+    fi
+    rm -f "$tmp"
+}
+
 case ${1:-} in
     up)         cmd_up ;;
     down)       cmd_down ;;
@@ -227,5 +266,7 @@ case ${1:-} in
     check-self) cmd_check_self "${2:-}" ;;
     doctor)     cmd_doctor ;;
     parse)      cmd_parse "${2:?file}" ;;
-    *)          echo "usage: pirate-netns up|down|repair|reload|setpeer|reconnect|check|check-self|doctor|parse FILE" >&2; exit 2 ;;
+    servers)    cmd_servers "${2:?file}" ;;
+    servers-install) cmd_servers_install "${2:?file}" ;;
+    *)          echo "usage: pirate-netns up|down|repair|reload|setpeer|reconnect|check|check-self|doctor|parse FILE|servers FILE|servers-install FILE" >&2; exit 2 ;;
 esac

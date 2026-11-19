@@ -86,9 +86,34 @@ echo "server list"
 servers_built() {
     local got
     got=$(pz "PROTON_CACHE=$FIX/serverlist.json; build_servers" | jq -r '[.servers[].n] | join(",")')
-    [[ $got == 'TEST-NL#1,TEST-NY#1' ]] || { echo "got: $got"; return 1; }
+    [[ $got == 'NL#1,US-NY#1' ]] || { echo "got: $got"; return 1; }
 }
-check "only P2P servers, no Secure Core, Tor or duplicates" servers_built
+check "only P2P servers: no Secure Core, Tor, duplicates, bad keys or bad names" servers_built
+
+# `pirate server refresh` with a stand-in Proton app that just updates a stand-in cache,
+# and a recorder instead of the root install
+refresh_with() {  # snapshot-date-of-installed-list extra-args
+    mkdir -p "$T/r/bin" "$T/r/etc"
+    cp "$FIX/serverlist.json" "$T/r/cache.json"; touch -d 2026-01-01 "$T/r/cache.json"
+    printf '#!/bin/sh\nsleep 1; touch "%s"\n' "$T/r/cache.json" > "$T/r/bin/protonvpn-app"; chmod +x "$T/r/bin/protonvpn-app"
+    printf '{"snapshot_date":"%s","servers":[{"n":"US-NY#1"}]}' "$1" > "$T/r/etc/servers.json"
+    rm -f "$T/r/installed"
+    PATH=$T/r/bin:$PATH WAYLAND_DISPLAY=test pz "
+        ETC=$T/r/etc PROTON_CACHE=$T/r/cache.json
+        pgrep() { return 1 }; pkill() { : }; systemctl() { return 1 }; desktop_notify() { : }
+        run_sudo() { print -r -- \"\$*\" > $T/r/installed }
+        cmd_server_refresh $2"
+}
+refresh_installs() {
+    refresh_with 2026-01-01 "" >/dev/null || { echo "refresh failed"; return 1; }
+    grep -q "servers-install $T/r/cache.json" "$T/r/installed" 2>/dev/null || { echo "never installed the refreshed list"; return 1; }
+}
+refresh_auto_waits() {
+    refresh_with "$(date +%F)" --auto >/dev/null
+    [[ ! -e $T/r/installed ]] || { echo "refreshed a list that was only a day old"; return 1; }
+}
+check "server refresh opens the Proton app, waits for its cache, installs the list" refresh_installs
+check "the weekly timer leaves a fresh list alone" refresh_auto_waits
 
 echo "settings file"
 check "a setting saves and reads back" pz 'ensure_config; set_config COUNTRY NL; [[ $(get_config COUNTRY) == NL ]]'

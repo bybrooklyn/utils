@@ -21,7 +21,9 @@ PROTON_CACHE=$HOME/.cache/Proton/VPN/serverlist.json
 USER_UNIT=$HOME/.config/systemd/user/pirate-session.service
 DESKTOP_OVERRIDE=$HOME/.local/share/applications/org.qbittorrent.qBittorrent.desktop
 SESSION_ENV=/run/user/$UID/pirate/session.env
-UNITS=(pirate-netns.service pirate-vpnd.service pirate-qbittorrent.service)
+UNITS=(pirate-netns.service pirate-vpnd.service pirate-qbittorrent.service pirate-servers.service)
+USER_UNITS=(pirate-session.service pirate-servers-refresh.service pirate-servers-refresh.timer)
+SERVERS_MAX_AGE=30   # days before `pirate server refresh --auto` (the weekly timer) refreshes the list
 NEED_TESTS=0
 
 autoload -Uz colors && colors
@@ -389,19 +391,7 @@ EOF
     import_config $src $2
 }
 
-build_servers() {
-    [[ -r $PROTON_CACHE ]] || return 1
-    jq --arg date "$(date -r $PROTON_CACHE +%F)" '
-        (.MaxTier // 2) as $t
-        | { snapshot_date: $date,
-            servers: ([ .LogicalServers[]
-                | select(.Status == 1 and .Tier <= $t and (.Features % 8) >= 4
-                         and (.Features % 2) == 0 and ((.Features / 2 | floor) % 2) == 0)
-                | . as $l | .Servers[]
-                | select(.Status == 1 and (.X25519PublicKey // "") != "" and (.EntryIP // "") != "")
-                | { n: $l.Name, cc: $l.ExitCountry, city: $l.City, score: $l.Score, ip: .EntryIP, pub: .X25519PublicKey } ]
-              | group_by(.ip + .pub) | map(min_by(.score)) | sort_by(.score)) }' $PROTON_CACHE
-}
+build_servers() { bash $SRC/pirate-netns servers $PROTON_CACHE }   # same code root uses to install it
 
 step_servers() {
     local tmp=$(mktemp) n=0
@@ -570,16 +560,17 @@ step_desktop() {
     ok "app menu and magnet links open qBittorrent inside the VPN"
     rm -f $HOME/.config/autostart/qbittorrent.desktop
 
-    tmp=$(mktemp)
-    render $SRC/pirate-session.service > $tmp
-    if cmp -s $tmp $USER_UNIT; then
-        rm -f $tmp
-    else
-        mv -f $tmp $USER_UNIT
-        systemctl --user daemon-reload
-    fi
+    local u reload=0
+    for u in $USER_UNITS; do
+        tmp=$(mktemp)
+        render $SRC/$u > $tmp
+        if cmp -s $tmp ${USER_UNIT:h}/$u; then rm -f $tmp; else mv -f $tmp ${USER_UNIT:h}/$u; reload=1; fi
+    done
+    (( reload )) && systemctl --user daemon-reload
     systemctl --user is-enabled -q pirate-session.service || systemctl --user enable -q pirate-session.service
     ok "qBittorrent starts inside the VPN when you log in"
+    systemctl --user is-enabled -q pirate-servers-refresh.timer || systemctl --user enable -q --now pirate-servers-refresh.timer
+    ok "the server list refreshes itself once it's $SERVERS_MAX_AGE days old (checked weekly)"
 
     ex=$(kreadconfig6 --file ksmserverrc --group General --key excludeApps)
     [[ ,$ex, == *,qbittorrent,* ]] ||
@@ -682,12 +673,9 @@ cmd_status() {
         else warn "qBittorrent isn't running — open it from the app menu or run 'pirate open'"; fi
     fi
 
-    local snap snap_days
-    snap=$(jq -r '.snapshot_date // empty' $ETC/servers.json 2>/dev/null)
-    if [[ $snap == <->-<->-<-> ]]; then
-        snap_days=$(( ( EPOCHSECONDS - $(date -d $snap +%s) ) / 86400 ))
-        (( snap_days > 60 )) && warn "server list is from $snap ($snap_days days old), so some servers pirate switches to may be gone — open the Proton VPN app once so it refreshes its list, disconnect it, then run 'pirate'"
-    fi
+    local snap_days=$(servers_age_days)
+    [[ -n $snap_days ]] && (( snap_days > 60 )) &&
+        warn "server list is $snap_days days old, so some servers pirate switches to may be gone — run 'pirate server refresh'"
 
     imported=$(meta IMPORTED)
     if [[ -n $imported ]]; then
@@ -722,6 +710,61 @@ cmd_doctor() {
 
 reload_daemon() { systemctl --no-ask-password reload pirate-vpnd.service 2>/dev/null || true }
 
+servers_age_days() {  # how old the installed server list's Proton data is, empty if unknown
+    local snap=$(jq -r '.snapshot_date // empty' $ETC/servers.json 2>/dev/null)
+    [[ $snap == <->-<->-<-> ]] && print $(( (EPOCHSECONDS - $(date -d $snap +%s)) / 86400 ))
+}
+
+proton_cache_mtime() { stat -c %Y $PROTON_CACHE 2>/dev/null || print 0 }
+
+# Refresh the server list. Proton's API only answers Proton's own apps, so pirate doesn't call it:
+# it opens the Proton VPN app, which refreshes its own cache when it starts, waits for the cache to
+# change, closes the app again, and rebuilds /etc/pirate/servers.json from it through the root-owned
+# pirate-servers.service. --auto (the weekly timer) does nothing until the list is SERVERS_MAX_AGE days old.
+cmd_server_refresh() {  # [--auto]
+    local auto=0 age before i pid="" snap
+    [[ ${1:-} == --auto ]] && auto=1
+    age=$(servers_age_days)
+    (( auto )) && [[ -n $age ]] && (( age < SERVERS_MAX_AGE )) && return 0
+
+    # the app may already have refreshed its cache since pirate last read it
+    snap=$(jq -r '.snapshot_date // empty' $ETC/servers.json 2>/dev/null)
+    if [[ ! -r $PROTON_CACHE || $(date -r $PROTON_CACHE +%F) == $snap ]]; then
+        if (( ! $+commands[protonvpn-app] )); then
+            (( auto )) && return 0
+            die "the Proton VPN app isn't installed. pirate gets its server list from the app: install it (proton-vpn-gtk-app), sign in once, then run 'pirate server refresh'"
+        fi
+        if [[ -z ${WAYLAND_DISPLAY:-}${DISPLAY:-} ]]; then
+            (( auto )) && return 0
+            die "this needs your desktop session, because the Proton VPN app is a window"
+        fi
+        before=$(proton_cache_mtime)
+        if ! pgrep -u $UID -f 'protonvpn-app|proton\.vpn\.app\.gtk' >/dev/null; then
+            bold "Opening the Proton VPN app for a moment so it refreshes its server list"
+            protonvpn-app &>/dev/null &!
+            pid=$!
+        fi
+        for (( i = 0; i < 90; i++ )); do
+            [[ $(proton_cache_mtime) != $before ]] && break
+            if [[ -e /sys/class/net/proton0 ]]; then
+                warn "the Proton app connected to the VPN. Disconnect it, it fights pirate's tunnel"
+                break
+            fi
+            sleep 2
+        done
+        [[ -n $pid ]] && { kill $pid 2>/dev/null; pkill -u $UID -f 'proton\.vpn\.app\.gtk' 2>/dev/null }
+        if [[ $(proton_cache_mtime) == $before ]]; then
+            (( auto )) && desktop_notify normal "pirate: server list not refreshed" \
+                "The Proton VPN app didn't update its server list. Open it, sign in, then run 'pirate server refresh'."
+            die "the Proton VPN app didn't update its server list within 3 minutes. Open it, make sure you're signed in, and try again"
+        fi
+        ok "the Proton app refreshed its server list"
+    fi
+    systemctl --no-ask-password start pirate-servers.service 2>/dev/null ||
+        run_sudo $LIB/pirate-netns servers-install $PROTON_CACHE || die "couldn't install the new server list"
+    ok "server list: $(jq '.servers | length' $ETC/servers.json) P2P servers, Proton data from $(jq -r .snapshot_date $ETC/servers.json)"
+}
+
 cmd_server() {
     local arg=${(U)1}
     [[ -r $ETC/servers.json ]] || die "not set up — run 'pirate'"
@@ -729,6 +772,9 @@ cmd_server() {
         "")
             print -r -- "current server: $(rd $RUN/server) · preference: country=$(get_config COUNTRY) server=$(get_config SERVER)" \
                 | sed 's/=\( \|$\)/=auto\1/g'
+            return ;;
+        REFRESH)
+            cmd_server_refresh "${@:2}"
             return ;;
         LIST)
             jq -r --arg cc "${(U)2}" '.servers | map(select($cc == "" or .cc == $cc)) | .[0:15][]
@@ -745,7 +791,7 @@ cmd_server() {
             jq -e --arg n $arg 'any(.servers[]; .n == $n)' $ETC/servers.json >/dev/null ||
                 die "$arg isn't in pirate's server list (try 'pirate server list ${arg[1,2]}')"
             set_config SERVER $arg ;;
-        *) die "usage: pirate server [CC | NAME | auto | list [CC]]" ;;
+        *) die "usage: pirate server [CC | NAME | auto | list [CC] | refresh]" ;;
     esac
     ok "server preference saved"
     reload_daemon
@@ -803,12 +849,12 @@ cmd_uninstall() {
     read -k 1 "reply?Remove pirate (services, namespace, app-menu override)? [y/N] "; print
     [[ $reply == [yY] ]] || return 1
     take_lock
-    systemctl --user disable --now pirate-session.service &>/dev/null
+    systemctl --user disable --now pirate-session.service pirate-servers-refresh.timer &>/dev/null
     run_sudo systemctl disable --now pirate-qbittorrent.service pirate-vpnd.service pirate-netns.service
     run_sudo rm -rf $LIB $ETC /etc/netns/pirate /var/lib/pirate /etc/polkit-1/rules.d/50-pirate.rules \
-        /etc/systemd/system/pirate-{netns,vpnd,qbittorrent}.service
+        /etc/systemd/system/pirate-{netns,vpnd,qbittorrent,servers}.service
     run_sudo systemctl daemon-reload
-    rm -f $USER_UNIT $DESKTOP_OVERRIDE $STATE_DIR/{tests-passed,request}(N)
+    rm -f ${USER_UNIT:h}/${^USER_UNITS} $DESKTOP_OVERRIDE $STATE_DIR/{tests-passed,request}(N)
     systemctl --user daemon-reload
     update-desktop-database ${DESKTOP_OVERRIDE:h} &>/dev/null
     kbuildsycoca6 &>/dev/null
@@ -849,6 +895,7 @@ usage: pirate [command]
   doctor                  status + full leak tests (sudo)
   open [magnet/torrent]   open qBittorrent inside the VPN (what the app menu uses)
   server [CC|NAME|auto]   prefer a country (NL, CH, …) or pin a server; `server list [CC]`
+  server refresh          get a fresh server list from the Proton VPN app (also runs on its own monthly)
   reconnect               fresh handshake with the current server
   config FILE             install a new/renewed Proton WireGuard config (sudo)
   start | stop | restart [--hard]   control the VPN services

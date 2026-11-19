@@ -6,7 +6,8 @@ polkit.addRule(function (action, subject) {
     var allowed = {
         "pirate-qbittorrent.service": ["start", "stop", "restart", "reset-failed"],
         "pirate-vpnd.service": ["start", "stop", "restart", "reload"],
-        "pirate-netns.service": ["start", "stop", "restart"]
+        "pirate-netns.service": ["start", "stop", "restart"],
+        "pirate-servers.service": ["start"]
     };
     var verbs = allowed[action.lookup("unit")];
     if (verbs && verbs.indexOf(action.lookup("verb")) >= 0)

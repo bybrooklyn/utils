@@ -1,0 +1,7 @@
+[Unit]
+Description=pirate: rebuild the P2P server list from the Proton app's cache
+ConditionPathExists=@HOME@/.cache/Proton/VPN/serverlist.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/pirate/pirate-netns servers-install @HOME@/.cache/Proton/VPN/serverlist.json

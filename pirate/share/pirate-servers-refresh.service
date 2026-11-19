@@ -1,0 +1,8 @@
+[Unit]
+Description=pirate: refresh the VPN server list when it's a month old (opens the Proton VPN app briefly)
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=@PIRATE@ server refresh --auto
+TimeoutStartSec=300
