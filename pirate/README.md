@@ -16,7 +16,7 @@ Claude Opus wrote the code.
 - **Port forwarding that stays up.** pirate asks Proton for a forwarded port every 45 seconds and tells qBittorrent which one it got. That's the difference between downloading at full speed and sitting there "firewalled" with three peers.
 - **It switches servers on its own** when one stops answering or refuses port forwarding.
 - **It's always on.** The tunnel comes up at boot. qBittorrent starts when you log in, from the app menu, and from magnet links, always inside the tunnel.
-- **It kills qBittorrent if you start it wrong.** Launch `/usr/bin/qbittorrent` from a terminal and it runs outside the VPN, so pirate closes it within about 20 seconds and tells you why.
+- **It kills qBittorrent if you start it wrong.** Launch `/usr/bin/qbittorrent` from a terminal and it runs outside the VPN, so pirate closes it within about 20 seconds and tells you why. If it hasn't closed a minute later, pirate kills it. `qbittorrent-nox` gets the same treatment.
 - **It sends desktop notifications** when something is actually wrong, like an expired config.
 - **No Proton app, no login.** One WireGuard key works on every Proton server.
 
@@ -121,13 +121,15 @@ pirate status
 | `COUNTRY` | the config's country | preferred server country, set by `pirate server CC` |
 | `SERVER` | automatic | a pinned server, set by `pirate server NAME` |
 | `KILL_HOST_QBT` | `yes` | close any qBittorrent started outside the VPN. `no` only warns. |
-| `FORWARD` | `bwrap` | how magnet links get handed to qBittorrent. `bwrap` does it from a process with no network at all. |
+| `FORWARD` | `bwrap` | how magnet links get handed to qBittorrent. `bwrap` does it from a process with no network at all. Set it to `plain` and it stays that way. |
 
 ## Automatic server switching
 
 pirate switches servers when the one you're on stops answering for a minute, or refuses port forwarding four times in a row. A server that failed gets skipped for 30 minutes.
 
 To know which servers exist, it reads the server list the Proton VPN app keeps at `~/.cache/Proton/VPN/serverlist.json`. If you've never had the app, there's no list and pirate just stays on your config's server. To fix that, install the Proton app, log in once, **disconnect it**, and run `pirate` again. Don't leave the app connected while pirate runs, they fight.
+
+The app only refreshes that list when you open it. `pirate status` warns once the list is over 60 days old, because by then Proton has retired some of those servers. Open the app, let it load, disconnect, and run `pirate`.
 
 ## Renewing the config
 
@@ -155,7 +157,7 @@ pirate config ~/Downloads/your-new-config.conf
 pirate uninstall
 ```
 
-It removes the services, the namespace, the config in `/etc/pirate` and the app menu override, and offers to put your old qBittorrent settings back. Then delete `~/utils` if you want.
+It removes the services, the namespace, the config in `/etc/pirate` and the app menu override, and offers to put your old qBittorrent settings back. If you say no, it unbinds qBittorrent from the tunnel so it works on your normal connection again. Then delete `~/utils` if you want.
 
 ## How it works
 

@@ -30,6 +30,7 @@ NOHS_SWITCH=60      # no handshake this long → switch server
 NAT_FAIL_SWITCH=4   # consecutive NAT-PMP failures → switch server
 BAD_TTL=1800        # failed servers are skipped for 30 min
 LOSS_NOTIFY=60      # only notify about outages lasting this long
+KILL_AFTER=60       # a qBittorrent outside the VPN that ignores SIGTERM this long gets SIGKILL
 
 log()  { printf '<6>%s\n' "$*"; }
 warn() { printf '<4>%s\n' "$*"; }
@@ -229,14 +230,26 @@ qbt_sync() {
 
 # Any qBittorrent of ours in the host network namespace is unprotected.
 leak_guard() {
-    local pid ns age
-    for pid in $(pgrep -u "$USER_ID" -x qbittorrent); do
+    local pid ns age t
+    for pid in "${!warned_at[@]}"; do
+        [[ -d /proc/$pid ]] || unset "warned_at[$pid]"
+    done
+    for pid in $(pgrep -u "$USER_ID" -x 'qbittorrent(-nox)?'); do
         ns=$(stat -Lc %i "/proc/$pid/ns/net" 2>/dev/null) || continue
         [[ $ns == "$HOST_NS" ]] || continue
         age=$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')
         ((${age:-0} >= 5)) || continue
-        [[ " ${warned_pids[*]} " == *" $pid "* ]] && continue
-        warned_pids+=("$pid")
+        t=${warned_at[$pid]:-}
+        if [[ -n $t ]]; then
+            # asked to stop already: give it KILL_AFTER seconds to save its torrents, then force it
+            if [[ $KILL_HOST_QBT == yes ]] && ((t > 0 && EPOCHSECONDS - t >= KILL_AFTER)); then
+                err "qBittorrent (pid $pid) is still running outside the VPN ${KILL_AFTER}s after being asked to stop — killing it"
+                kill -KILL "$pid" 2>/dev/null
+                warned_at[$pid]=0
+            fi
+            continue
+        fi
+        warned_at[$pid]=$EPOCHSECONDS
         err "qBittorrent (pid $pid) is running OUTSIDE the VPN namespace"
         if [[ $KILL_HOST_QBT == yes ]]; then
             kill -TERM "$pid" 2>/dev/null
@@ -283,7 +296,8 @@ main() {
     have_port=0 nat_fail=0 nohs_since=0 switches=0 next_renew=0 next_switch_at=0
     grace_until=$((EPOCHSECONDS + GRACE)) last_bump=0 qbt_disc=0
     expired_notified=0 degraded_notified=0 want_switch=0 want_reconnect=0
-    dead_servers=() natpmp_refused=() warned_pids=()
+    dead_servers=() natpmp_refused=()
+    declare -gA warned_at=()   # pid of a qBittorrent outside the VPN → when it was asked to stop (0 = killed)
     load_user_config
     cfg_mtime=$(stat -c %Y "$USER_CONFIG" 2>/dev/null || echo 0)
     req_mtime=$(stat -c %Y "$REQUEST" 2>/dev/null || echo 0)

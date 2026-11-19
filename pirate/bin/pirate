@@ -107,9 +107,9 @@ set_config() {  # key value
 
 qbt_pids() { pgrep -u $UID -x qbittorrent }
 
-host_qbt_pids() {
+host_qbt_pids() {  # also catches qbittorrent-nox, which pirate never starts
     local pid host=$(stat -Lc %i /proc/self/ns/net) out=()
-    for pid in $(qbt_pids); do
+    for pid in $(pgrep -u $UID -x 'qbittorrent(-nox)?'); do
         [[ $(stat -Lc %i /proc/$pid/ns/net 2>/dev/null) == $host ]] && out+=$pid
     done
     print -r -- $out
@@ -572,7 +572,10 @@ step_desktop() {
         kwriteconfig6 --file ksmserverrc --group General --key excludeApps "${ex:+$ex,}qbittorrent"
     ok "KDE won't restore qBittorrent outside the VPN at login"
 
-    if bwrap --unshare-net --dev-bind / / true 2>/dev/null; then set_config FORWARD bwrap; else set_config FORWARD plain; fi
+    # keep a FORWARD you chose; only fill it in when it's missing or invalid
+    if [[ $(get_config FORWARD) != (bwrap|plain) ]]; then
+        if bwrap --unshare-net --dev-bind / / true 2>/dev/null; then set_config FORWARD bwrap; else set_config FORWARD plain; fi
+    fi
 }
 
 step_finish() {
@@ -661,6 +664,13 @@ cmd_status() {
         hosts=$(host_qbt_pids)
         if [[ -n $hosts ]]; then fail "qBittorrent is running OUTSIDE the VPN (pid $hosts) — pirate-vpnd will stop it"; healthy=0
         else warn "qBittorrent isn't running — open it from the app menu or run 'pirate open'"; fi
+    fi
+
+    local snap snap_days
+    snap=$(jq -r '.snapshot_date // empty' $ETC/servers.json 2>/dev/null)
+    if [[ $snap == <->-<->-<-> ]]; then
+        snap_days=$(( ( EPOCHSECONDS - $(date -d $snap +%s) ) / 86400 ))
+        (( snap_days > 60 )) && warn "server list is from $snap ($snap_days days old), so some servers pirate switches to may be gone — open the Proton VPN app once so it refreshes its list, disconnect it, then run 'pirate'"
     fi
 
     imported=$(meta IMPORTED)
@@ -789,9 +799,15 @@ cmd_uninstall() {
     local ex=$(kreadconfig6 --file ksmserverrc --group General --key excludeApps)
     kwriteconfig6 --file ksmserverrc --group General --key excludeApps "${${(j:,:)${(s:,:)ex}:#qbittorrent}}"
     ok "pirate removed (your WireGuard config was in $ETC and is gone — download a new one to reinstall)"
+    local restored=0
     if [[ -f $QBT_CONF.bak-pirate-v3 ]]; then
         read -k 1 "reply?Restore qBittorrent's settings from before pirate? [y/N] "; print
-        [[ $reply == [yY] ]] && stop_qbt && cp -p $QBT_CONF.bak-pirate-v3 $QBT_CONF && ok "qBittorrent settings restored"
+        [[ $reply == [yY] ]] && stop_qbt && cp -p $QBT_CONF.bak-pirate-v3 $QBT_CONF && ok "qBittorrent settings restored" && restored=1
+    fi
+    # otherwise qBittorrent stays bound to wgpirate, which no longer exists, and never connects
+    if (( !restored )) && grep -q '^Session\\Interface' $QBT_CONF 2>/dev/null; then
+        stop_qbt && sed -i -E '/^Session\\Interface(Name)?=/d' $QBT_CONF &&
+            ok "qBittorrent is no longer tied to the VPN interface (it uses your normal connection now)"
     fi
 }
 
