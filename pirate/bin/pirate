@@ -149,10 +149,15 @@ stop_qbt() {
     return 1
 }
 
+# Only what qBittorrent needs before it starts lives in its config file: the VPN binding (which also
+# protects a copy started outside the namespace) and the WebUI that pirate-vpnd talks to. Everything
+# else (save path, listen port, UPnP) pirate-vpnd sets through the WebUI API while it runs.
 qbt_conf() {  # check|apply — check exits 3 and lists what needs changing
-    python3 - $1 $QBT_CONF "$(download_dir)" $QBT_USER $CONFIG_DIR/webui.pass <<'EOF'
+    local ver=""
+    [[ $1 == apply ]] && ver=$(/usr/bin/qbittorrent --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)
+    python3 - $1 $QBT_CONF $QBT_USER $CONFIG_DIR/webui.pass "$ver" <<'EOF'
 import base64, hashlib, os, re, sys
-mode, conf, dl, user, passfile = sys.argv[1:6]
+mode, conf, user, passfile, ver = sys.argv[1:6]
 try:
     pw = open(passfile).read().strip()
 except FileNotFoundError:
@@ -179,25 +184,34 @@ def password_ok(value):
     salt, want = base64.b64decode(m[1]), base64.b64decode(m[2])
     return hashlib.pbkdf2_hmac("sha512", pw.encode(), salt, 100000, len(want)) == want
 
+# qBittorrent 5.3 moved the WebUI settings from [Preferences] WebUI\Key to a [WebUI] section.
+# Use whichever layout the file already has; a file with neither follows the installed version.
+webui = {"Enabled": "true", "Address": "127.0.0.1", "Port": "8080", "LocalHostAuth": "false", "Username": user}
+if "[WebUI]" in lines:
+    new_layout = True
+elif any(get("Preferences", "WebUI\\" + k) is not None for k in [*webui, "Password_PBKDF2"]):
+    new_layout = False
+else:
+    new_layout = tuple(int(x) for x in (ver or "0.0").split(".")) >= (5, 3)
+wsec, wkey = ("WebUI", lambda k: k) if new_layout else ("Preferences", lambda k: "WebUI\\" + k)
+
 critical = {
     "BitTorrent": {r"Session\Interface": "wgpirate", r"Session\InterfaceName": "wgpirate"},
-    "Preferences": {r"WebUI\Enabled": "true", r"WebUI\Address": "127.0.0.1", r"WebUI\Port": "8080",
-                    r"WebUI\LocalHostAuth": "false", r"WebUI\Username": user},
+    wsec: {wkey(k): v for k, v in webui.items()},
 }
-needs = [k for s, kv in critical.items() for k, v in kv.items() if get(s, k) != v]
-if not password_ok(get("Preferences", r"WebUI\Password_PBKDF2")):
+needs = [k if s == "BitTorrent" else "WebUI " + k.split("\\")[-1]
+         for s, kv in critical.items() for k, v in kv.items() if get(s, k) != v]
+if not password_ok(get(wsec, wkey("Password_PBKDF2"))):
     needs.append("WebUI password")
 if mode == "check":
     print(", ".join(needs))
     sys.exit(3 if needs else 0)
 
 want = {s: dict(kv) for s, kv in critical.items()}
-want["BitTorrent"][r"Session\DefaultSavePath"] = dl
-want["Network"] = {"PortForwardingEnabled": "false"}
 if "WebUI password" in needs:
     salt = os.urandom(16)
     key = hashlib.pbkdf2_hmac("sha512", pw.encode(), salt, 100000, 64)
-    want["Preferences"][r"WebUI\Password_PBKDF2"] = '"@ByteArray(%s:%s)"' % (
+    want[wsec][wkey("Password_PBKDF2")] = '"@ByteArray(%s:%s)"' % (
         base64.b64encode(salt).decode(), base64.b64encode(key).decode())
 
 pending = {s: dict(kv) for s, kv in want.items()}
@@ -535,7 +549,7 @@ step_qbt() {
     if [[ -n $needs ]]; then
         [[ -f $QBT_CONF.bak-pirate-v3 || ! -f $QBT_CONF ]] || cp -p $QBT_CONF $QBT_CONF.bak-pirate-v3
         qbt_conf apply || die "couldn't write $QBT_CONF"
-        ok "qBittorrent settings: bound to wgpirate, WebUI login set, saves to $(download_dir)"
+        ok "qBittorrent settings: bound to wgpirate, WebUI login set"
     else
         ok "qBittorrent settings OK"
     fi
