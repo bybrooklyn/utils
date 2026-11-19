@@ -110,6 +110,16 @@ check "qBittorrent already right: nothing to send" pv "[[ \$(qbt_changes '$PREFS
 check "a new DOWNLOAD_DIR is sent as save_path" pv "[[ \$(qbt_changes '$PREFS' 55101 /data/other) == '{\"save_path\":\"/data/other\"}' ]]"
 check "a new port and UPnP back on are both sent" pv "[[ \$(qbt_changes '${PREFS/\"upnp\":false/\"upnp\":true}' 40000 /data/films) == '{\"upnp\":false,\"listen_port\":40000}' ]]"
 
+check "messages land in the event log with a time and a level" pv "
+    EVENTS=$T/events.log; log 'switched to TEST-NL#1'; err 'something broke'
+    grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8} info  switched to TEST-NL#1$' \$EVENTS &&
+    grep -qE ' error something broke$' \$EVENTS"
+check "a big event log is trimmed to the last 2000 lines" pv "
+    EVENTS=$T/big.log; seq 1 200000 > \$EVENTS; trim_events
+    [[ \$(wc -l < \$EVENTS) == 2000 && \$(tail -1 \$EVENTS) == 200000 ]]"
+check "a small event log is left alone" pv "
+    EVENTS=$T/small.log; seq 1 10 > \$EVENTS; trim_events; [[ \$(wc -l < \$EVENTS) == 10 ]]"
+
 echo "guard"
 guard_test() {
     cp /usr/bin/sleep "$T/qbittorrent-nox"

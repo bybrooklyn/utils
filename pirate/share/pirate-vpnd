@@ -32,9 +32,20 @@ BAD_TTL=1800        # failed servers are skipped for 30 min
 LOSS_NOTIFY=60      # only notify about outages lasting this long
 KILL_AFTER=60       # a qBittorrent outside the VPN that ignores SIGTERM this long gets SIGKILL
 
-log()  { printf '<6>%s\n' "$*"; }
-warn() { printf '<4>%s\n' "$*"; }
-err()  { printf '<3>%s\n' "$*"; }
+EVENTS=$STATE/events.log   # pirate's own history (`pirate logs`), kept apart from the busy journal
+EVENTS_MAX=1048576         # past this size, trim to the last EVENTS_KEEP lines
+EVENTS_KEEP=2000
+
+# Each message goes to the journal and to the event log. These are only called when something
+# changes (state, port, server, guard), never every tick, so the log stays small.
+event() { printf '%(%F %T)T %-5s %s\n' -1 "$1" "$2" >>"$EVENTS" 2>/dev/null || true; }
+log()  { printf '<6>%s\n' "$*"; event info "$*"; }
+warn() { printf '<4>%s\n' "$*"; event warn "$*"; }
+err()  { printf '<3>%s\n' "$*"; event error "$*"; }
+trim_events() {
+    [[ -f $EVENTS ]] && (($(stat -c %s "$EVENTS") > EVENTS_MAX)) || return 0
+    tail -n "$EVENTS_KEEP" "$EVENTS" >"$EVENTS.tmp" && mv -f "$EVENTS.tmp" "$EVENTS"
+}
 nsx()  { nsenter --net="$NSP" "$@"; }
 sd()   { systemd-notify "$@" 2>/dev/null || true; }
 put()  { printf '%s\n' "$2" >"$RUN/$1.tmp" && mv -f "$RUN/$1.tmp" "$RUN/$1"; }
@@ -331,6 +342,8 @@ main() {
     trap '[[ -n $nap_pid ]] && kill "$nap_pid" 2>/dev/null' HUP
     trap 'exit 0' TERM INT
 
+    trim_events
+    next_trim=$((EPOCHSECONDS + 21600))
     refresh_peer
     sd READY=1
     log "pirate-vpnd started (origin $ORIGIN_NAME, current $CUR_NAME)"
@@ -341,6 +354,7 @@ main() {
         sd WATCHDOG=1
         now=$EPOCHSECONDS
         put updated "$now"
+        ((now >= next_trim)) && { trim_events; next_trim=$((now + 21600)); }
 
         # suspend/resume or a stalled loop: re-set the endpoint and check immediately
         if ((now - last_tick > 3 * TICK)); then

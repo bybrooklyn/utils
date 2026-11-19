@@ -827,6 +827,18 @@ cmd_uninstall() {
     fi
 }
 
+EVENTS=/var/lib/pirate/events.log
+
+cmd_logs() {  # [--journal]
+    local journal=(journalctl -u pirate-netns -u pirate-vpnd -u pirate-qbittorrent -f -o short-iso)
+    [[ ${1:-} == --journal ]] && exec $journal
+    if [[ ! -r $EVENTS ]]; then
+        warn "no event log yet ($EVENTS appears once pirate-vpnd is updated by running 'pirate'), showing the journal"
+        exec $journal
+    fi
+    tail -n 50 -F $EVENTS
+}
+
 usage() {
     cat <<'EOF'
 usage: pirate [command]
@@ -840,7 +852,7 @@ usage: pirate [command]
   reconnect               fresh handshake with the current server
   config FILE             install a new/renewed Proton WireGuard config (sudo)
   start | stop | restart [--hard]   control the VPN services
-  logs                    follow the pirate logs
+  logs [--journal]        pirate's recent events, then follow (--journal: the full system log)
   uninstall               remove pirate
 EOF
 }
@@ -858,7 +870,7 @@ case ${1:-setup} in
     start)          cmd_start ;;
     stop)           cmd_stop ;;
     restart)        shift; cmd_restart "$@" ;;
-    logs)           journalctl -u pirate-netns -u pirate-vpnd -u pirate-qbittorrent -f -o short-iso ;;
+    logs)           shift; cmd_logs "$@" ;;
     uninstall)      cmd_uninstall ;;
     session-start)  cmd_session_start ;;
     session-stop)   cmd_session_stop ;;
