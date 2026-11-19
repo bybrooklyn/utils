@@ -117,9 +117,10 @@ esac
 
 find_conf() {  # newest Proton WireGuard config in ~/Downloads
     local f
-    for f in $(ls -t "$HOME"/Downloads/*.conf 2>/dev/null); do
+    while IFS= read -r -d '' f; do
+        f=${f#* }
         grep -q '^\[Peer\]' "$f" && grep -q '^PrivateKey' "$f" && grep -q '10\.2\.0\.2' "$f" && { echo "$f"; return 0; }
-    done
+    done < <(find "$HOME/Downloads" -maxdepth 1 -type f -name '*.conf' -printf '%T@ %p\0' 2>/dev/null | sort -z -rn)
     return 1
 }
 
