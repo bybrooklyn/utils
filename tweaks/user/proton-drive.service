@@ -1,0 +1,26 @@
+[Unit]
+Description=Proton Drive mounted at ~/Proton (rclone)
+Documentation=https://rclone.org/protondrive/
+# Starts only once `rclone config` has made the remote called "proton".
+ConditionPathExists=%h/.config/rclone/rclone.conf
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+ExecStartPre=/usr/bin/mkdir -p %h/Proton
+ExecStart=%h/.local/share/rclone/rclone mount proton: %h/Proton \
+    --vfs-cache-mode full \
+    --vfs-cache-max-size 20G \
+    --vfs-cache-max-age 24h \
+    --cache-dir %h/.cache/rclone-proton \
+    --dir-cache-time 5m \
+    --poll-interval 1m \
+    --log-level NOTICE
+ExecStop=/usr/bin/fusermount3 -uz %h/Proton
+Restart=always
+RestartSec=30
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target
