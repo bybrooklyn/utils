@@ -38,4 +38,4 @@ pirate also has a one-line install that does step 1 for you:
 curl -fsSL https://raw.githubusercontent.com/bybrooklyn/utils/main/pirate/install.sh | bash
 ```
 
-Claude Opus wrote most of the code in here. I decide what it does and test it on my own machines.
+Claude Opus wrote pirate and vfios.
