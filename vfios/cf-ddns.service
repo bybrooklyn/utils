@@ -1,0 +1,8 @@
+[Unit]
+Description=Move Cloudflare A records that point at home to home's current public IPv4
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/cf-ddns/cf-ddns.py

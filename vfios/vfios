@@ -1,0 +1,53 @@
+#!/bin/sh
+# vfios: manage cf-ddns, which keeps every Cloudflare A record pointing at home in step with home's
+# public IPv4 (Verizon Fios). Runs on the server; from any other machine it runs itself there over SSH
+# (VFIOS_HOST, default brook@server).
+SCRIPT="$HOME/cf-ddns/cf-ddns.py"
+TOKEN="$HOME/.config/cf-ddns/token"
+
+if [ ! -f "$SCRIPT" ]; then
+  exec ssh -t "${VFIOS_HOST:-brook@server}" "~/.local/bin/vfios $*"
+fi
+
+cmd=${1:-status}
+[ $# -gt 0 ] && shift
+case "$cmd" in
+  status|st)
+    python3 "$SCRIPT" --status
+    printf 'timer                    %s, %s\n' "$(systemctl --user is-enabled cf-ddns.timer 2>/dev/null)" \
+      "$(systemctl --user is-active cf-ddns.timer 2>/dev/null)"
+    systemctl --user list-timers cf-ddns.timer --no-pager --no-legend | awk '{print "next check               " $1, $2, $3}'
+    ;;
+  records|ls)   python3 "$SCRIPT" --list ;;
+  now|run)      python3 "$SCRIPT" --force ;;
+  dry)          if [ -n "$1" ]; then python3 "$SCRIPT" --dry-run --ip "$1"; else python3 "$SCRIPT" --dry-run --force; fi ;;
+  set)          [ -n "$1" ] || { echo "usage: vfios set <new IPv4>"; exit 2; }; python3 "$SCRIPT" --force --ip "$1" ;;
+  seed)         [ -n "$1" ] || { echo "usage: vfios seed <IPv4 the records hold now>"; exit 2; }; python3 "$SCRIPT" --seed "$1" ;;
+  log)          journalctl --user -u cf-ddns.service --no-pager -n "${1:-40}" ;;
+  on)           systemctl --user enable --now cf-ddns.timer && echo "timer on (every 5 min)" ;;
+  off)          systemctl --user disable --now cf-ddns.timer && echo "timer off" ;;
+  token)
+    echo "Paste the new Cloudflare token (Zone Read + DNS Edit, all zones), then Enter and Ctrl-D:"
+    umask 077; mkdir -p "$(dirname "$TOKEN")"; cat > "$TOKEN.new" && mv "$TOKEN.new" "$TOKEN" && python3 "$SCRIPT" --status | grep token
+    ;;
+  edit)         ${EDITOR:-nano} "$SCRIPT" ;;
+  help|-h|--help|*)
+    cat <<'EOF'
+vfios: keep Cloudflare DNS pointed at home (cf-ddns)
+
+  vfios               status: last known and current public IP, token expiry, timer
+  vfios records       list the A records that point at home (all zones)
+  vfios now           check and update right now
+  vfios dry [IP]      show what would change (optionally pretending the IP is IP)
+  vfios set IP        move every home record to IP now
+  vfios seed IP       tell it which IP the home records hold now (no DNS change)
+  vfios log [N]       last N lines of its log (default 40)
+  vfios on | off      enable or disable the 5-minute timer
+  vfios token         replace the Cloudflare token (paste it, never on the command line)
+
+Only A records holding the last known home IP are touched. Records pointing anywhere else
+(GitHub Pages, other servers, Workers 100::) are never changed. Files: ~/cf-ddns/cf-ddns.py,
+~/.config/cf-ddns/{token,state.json}, ~/.config/systemd/user/cf-ddns.{service,timer}.
+EOF
+    ;;
+esac
