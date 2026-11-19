@@ -9,9 +9,8 @@ STAMP=$(date +%Y%m%d-%H%M%S)
 # repo path -> where it goes
 LINKS=(
     "home/zshrc                               $HOME/.zshrc"
+    "home/zprofile                            $HOME/.zprofile"
     "home/p10k.zsh                            $HOME/.p10k.zsh"
-    "config/fish/config.fish                  $HOME/.config/fish/config.fish"
-    "config/alacritty/alacritty.toml          $HOME/.config/alacritty/alacritty.toml"
     "config/btop/btop.conf                    $HOME/.config/btop/btop.conf"
     "config/fastfetch/config.jsonc            $HOME/.config/fastfetch/config.jsonc"
     "config/micro/settings.json               $HOME/.config/micro/settings.json"

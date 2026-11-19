@@ -1,0 +1,4 @@
+
+# >>> termium >>>
+case ":$PATH:" in *:'/home/brook/.local/bin':*) ;; *) export PATH='/home/brook/.local/bin':"$PATH" ;; esac
+# <<< termium <<<

@@ -5,8 +5,7 @@ General stuff I use every day on my PC and my home server. Each folder is its ow
 | [pirate](pirate/) | qBittorrent inside a Proton VPN tunnel, and nothing else on the VPN. Port forwarding, server failover, no leaks. |
 | [vfios](vfios/) | Keeps every Cloudflare DNS record that points at home on your home's current IP, across all your domains. |
 | [quest-wireless-adb](quest-wireless-adb/) | Turns wireless adb back on every time a Meta Quest reboots. |
-| [tweaks](tweaks/) | Small system fixes for a fresh install: USB wakeup off, swappiness, uinput, a Proton Drive mount. |
-| [dotfiles](dotfiles/) | My zsh, fish, prompt, terminal and editor configs. |
+| [dotfiles](dotfiles/) | My zsh setup and prompt, plus btop, fastfetch and micro configs. |
 
 ## How to use it
 
@@ -26,7 +25,6 @@ Everything here is built for my setup: CachyOS (Arch) with KDE Plasma on Wayland
    bash ~/utils/pirate/install.sh
    bash ~/utils/vfios/install.sh               # on the machine your DNS should follow
    bash ~/utils/quest-wireless-adb/install.sh
-   bash ~/utils/tweaks/apply.sh
    bash ~/utils/dotfiles/install.sh
    ```
 
