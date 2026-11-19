@@ -1,0 +1,10 @@
+[Unit]
+Description=Quest: re-enable wireless adb on USB plug-in, keep the headset awake while charging
+
+[Service]
+ExecStart=%h/.local/bin/quest-wireless-adb
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

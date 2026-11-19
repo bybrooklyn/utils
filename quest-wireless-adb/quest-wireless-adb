@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# For a Meta Quest plugged in over USB: turns wireless adb back on (the Quest clears it at every
+# reboot) and, while the headset is on a charger, keeps it from sleeping. Only acts on a device
+# whose model starts with "Quest". Stop it with: systemctl --user disable --now quest-wireless-adb
+set -u
+while true; do
+  line=$(adb devices -l 2>/dev/null | grep -E 'usb:.*model:Quest' | head -1)
+  if [ -n "$line" ]; then
+    serial=${line%% *}
+    ip=$(adb -s "$serial" shell ip -4 addr show wlan0 2>/dev/null | tr -d '\r' | sed -n 's/.*inet \([0-9.]*\)\/.*/\1/p' | head -1)
+    if [ -n "$ip" ] && ! adb devices 2>/dev/null | grep -q "^$ip:5555[[:space:]]*device"; then
+      adb -s "$serial" tcpip 5555 >/dev/null 2>&1
+      sleep 2
+      adb connect "$ip:5555" >/dev/null 2>&1
+    fi
+  fi
+  # Keep-awake: only while charging, so an unplugged headset can still sleep and save its battery.
+  for s in $(adb devices -l 2>/dev/null | awk 'NR>1 && $2=="device" && /model:Quest/ {print $1}'); do
+    if adb -s "$s" shell dumpsys battery 2>/dev/null | tr -d '\r' | grep -q 'AC powered: true\|USB powered: true'; then
+      adb -s "$s" shell settings put global stay_on_while_plugged_in 7 >/dev/null 2>&1
+      adb -s "$s" shell am broadcast -a com.oculus.vrpowermanager.prox_close >/dev/null 2>&1
+    fi
+  done
+  sleep 60
+done
