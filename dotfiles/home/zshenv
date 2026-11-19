@@ -1,0 +1,4 @@
+. "$HOME/.cargo/env"
+
+# API keys and other secrets live outside git, in ~/.config/secrets.env (mode 600)
+[ -r "$HOME/.config/secrets.env" ] && . "$HOME/.config/secrets.env"

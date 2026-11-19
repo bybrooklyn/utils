@@ -10,6 +10,7 @@ STAMP=$(date +%Y%m%d-%H%M%S)
 LINKS=(
     "home/zshrc                               $HOME/.zshrc"
     "home/zprofile                            $HOME/.zprofile"
+    "home/zshenv                              $HOME/.zshenv"
     "home/p10k.zsh                            $HOME/.p10k.zsh"
     "config/btop/btop.conf                    $HOME/.config/btop/btop.conf"
     "config/fastfetch/config.jsonc            $HOME/.config/fastfetch/config.jsonc"
