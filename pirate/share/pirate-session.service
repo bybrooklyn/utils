@@ -1,7 +1,7 @@
 [Unit]
 Description=pirate: qBittorrent (VPN namespace) for this desktop session
 PartOf=graphical-session.target
-After=graphical-session.target plasma-kwin_wayland.service
+After=graphical-session.target
 
 [Service]
 Type=oneshot

@@ -14,9 +14,9 @@ Group=@GROUP@
 NetworkNamespacePath=/run/netns/pirate
 BindReadOnlyPaths=/etc/pirate/resolve:/run/systemd/resolve
 BindReadOnlyPaths=/etc/pirate/nsswitch.conf:/etc/nsswitch.conf
-Environment=HOME=@HOME@ XDG_RUNTIME_DIR=/run/user/@UID@ WAYLAND_DISPLAY=wayland-0 QT_QPA_PLATFORM=wayland
-Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/@UID@/bus XDG_SESSION_TYPE=wayland
-Environment=XDG_CURRENT_DESKTOP=KDE KDE_FULL_SESSION=true KDE_SESSION_VERSION=6
+Environment=HOME=@HOME@ XDG_RUNTIME_DIR=/run/user/@UID@
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/@UID@/bus
+# the desktop (Wayland or X11, any desktop) comes from the session: `pirate` writes this file at login
 EnvironmentFile=-/run/user/@UID@/pirate/session.env
 ExecStartPre=+/usr/local/lib/pirate/pirate-netns check
 ExecStartPre=/usr/local/lib/pirate/pirate-netns check-self

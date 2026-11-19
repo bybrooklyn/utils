@@ -146,6 +146,19 @@ cmd_check() {
     ! nsenter --net=/proc/1/ns/net ip link show "$IF" &>/dev/null || die "$IF exists outside the namespace"
 }
 
+# A Wayland socket, or for X11 the display's socket file (the abstract X11 socket isn't reachable
+# from inside the namespace, but Xlib falls back to /tmp/.X11-unix/X<n>).
+have_display() {
+    if [[ -n ${WAYLAND_DISPLAY:-} ]]; then
+        [[ -S ${XDG_RUNTIME_DIR:-/nonexistent}/$WAYLAND_DISPLAY ]]
+    elif [[ -n ${DISPLAY:-} ]]; then
+        local n=${DISPLAY#*:}
+        [[ -S /tmp/.X11-unix/X${n%%.*} ]]
+    else
+        return 1
+    fi
+}
+
 cmd_check_self() {  # [--no-gui]
     [[ $(stat -Lc %i /proc/self/ns/net) == "$(stat -Lc %i "$NSP")" ]] || die "not inside the pirate namespace"
     [[ $(awk '$1 == "nameserver" { print $2 }' /etc/resolv.conf | sort -u | tr '\n' ' ') == "$GW " ]] ||
@@ -154,8 +167,7 @@ cmd_check_self() {  # [--no-gui]
     ! grep -Eq '^hosts:.*\bresolve\b' /etc/nsswitch.conf || die "nsswitch uses systemd-resolved (DNS leak)"
     [[ $(awk 'NR > 2 { sub(":", "", $1); print $1 }' /proc/net/dev | sort | tr '\n' ' ') == "lo $IF " ]] ||
         die "unexpected network interfaces"
-    [[ ${1:-} == --no-gui ]] || [[ -S ${XDG_RUNTIME_DIR:-/nonexistent}/${WAYLAND_DISPLAY:-wayland-0} ]] ||
-        die "no Wayland session socket"
+    [[ ${1:-} == --no-gui ]] || have_display || die "no desktop session to show qBittorrent on (Wayland or X11)"
 }
 
 cmd_doctor() {

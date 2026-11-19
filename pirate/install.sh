@@ -49,23 +49,24 @@ command -v systemctl >/dev/null || die "pirate needs systemd"
 ok "Linux with systemd"
 
 if command -v pacman >/dev/null; then
-    ok "pacman found (Arch, CachyOS, EndeavourOS, Manjaro...)"
-    PACMAN=1
+    PM=(sudo pacman -S --needed --noconfirm); ok "pacman (Arch, CachyOS, EndeavourOS, Manjaro...)"
+elif command -v apt-get >/dev/null; then
+    PM=(sudo apt-get install -y); ok "apt (Debian, Ubuntu, Mint, Pop!_OS...)"
+elif command -v dnf >/dev/null; then
+    PM=(sudo dnf install -y); ok "dnf (Fedora, Nobara...)"
 else
-    PACMAN=0
-    warn "no pacman. pirate was built on Arch and installs its packages with pacman."
-    say  "    It can still work if you install these yourself first:"
-    say  "    git zsh wireguard-tools libnatpmp (natpmpc) jq curl qbittorrent python3"
-    say  "    bubblewrap libnotify (notify-send) kconfig (kwriteconfig6) desktop-file-utils"
+    PM=()
+    warn "no pacman, apt or dnf, so pirate can't install its packages for you."
+    say  "    It still works if you install whatever provides these commands first:"
+    say  "    git zsh wg natpmpc jq curl qbittorrent python3 bwrap notify-send update-desktop-database"
     ask "Keep going anyway?" n || exit 1
 fi
 
-if [[ ${XDG_CURRENT_DESKTOP:-} == *KDE* && ${XDG_SESSION_TYPE:-} == wayland ]]; then
-    ok "KDE Plasma on Wayland"
+if [[ -n ${WAYLAND_DISPLAY:-} || -n ${DISPLAY:-} ]] && systemctl --user show-environment >/dev/null 2>&1; then
+    ok "desktop session: ${XDG_CURRENT_DESKTOP:-unknown desktop} on ${XDG_SESSION_TYPE:-${WAYLAND_DISPLAY:+wayland}}"
 else
-    warn "you're not in KDE Plasma on Wayland (desktop: ${XDG_CURRENT_DESKTOP:-none}, session: ${XDG_SESSION_TYPE:-none})"
-    say  "    pirate starts qBittorrent with Plasma's session and only knows how to do that on Plasma Wayland."
-    say  "    The VPN part works anywhere, the desktop part probably won't."
+    warn "this doesn't look like a desktop session (no Wayland or X11 display, or no systemd user session)"
+    say  "    pirate runs the qBittorrent app, so set it up from a terminal inside your desktop."
     ask "Keep going anyway?" n || exit 1
 fi
 
@@ -87,9 +88,9 @@ missing=()
 command -v git >/dev/null || missing+=(git)
 command -v zsh >/dev/null || missing+=(zsh)
 if ((${#missing[@]})); then
-    ((PACMAN)) || die "install ${missing[*]} and run this again"
+    ((${#PM[@]})) || die "install ${missing[*]} and run this again"
     say "  Installing ${missing[*]} (sudo)"
-    sudo pacman -S --needed --noconfirm "${missing[@]}" </dev/tty
+    "${PM[@]}" "${missing[@]}" </dev/tty
 fi
 ok "git and zsh"
 

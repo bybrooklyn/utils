@@ -115,6 +115,41 @@ refresh_auto_waits() {
 check "server refresh opens the Proton app, waits for its cache, installs the list" refresh_installs
 check "the weekly timer leaves a fresh list alone" refresh_auto_waits
 
+echo "packages"
+check "apt, dnf and pacman tables cover the same commands" pz '
+    [[ ${(ok)PKG_PACMAN} == ${(ok)PKG_APT} && ${(ok)PKG_APT} == ${(ok)PKG_DNF} ]]'
+missing_on() {  # pm word: with nothing installed, the package list for pm includes word
+    local got
+    got=$(pz "path=(); missing_packages $1")
+    [[ " $got " == *" $2 "* ]] || { echo "got: $got"; return 1; }
+}
+check "Debian/Ubuntu get the natpmpc package" missing_on apt natpmpc
+check "Debian/Ubuntu get libnotify-bin" missing_on apt libnotify-bin
+check "Fedora gets natpmpc from libnatpmp" missing_on dnf libnatpmp
+check "nothing to install when every command is there" pz '[[ -z $(missing_packages pacman) ]]'
+
+echo "desktop session"
+session_env() {  # fake `systemctl --user show-environment` output → what qBittorrent gets
+    pz "systemctl() { print -r -- '$1' }; SESSION_ENV=$T/session.env; write_session_env; cat $T/session.env"
+}
+wayland_session() {
+    local got
+    got=$(session_env $'WAYLAND_DISPLAY=wayland-1\nDISPLAY=:0\nXAUTHORITY=/x\nXDG_CURRENT_DESKTOP=GNOME\nQT_QPA_PLATFORM=xcb\nSESSION_MANAGER=x')
+    [[ $got == *WAYLAND_DISPLAY=wayland-1* && $got == *XDG_CURRENT_DESKTOP=GNOME* && $got == *QT_QPA_PLATFORM=wayland* ]] || { echo "$got"; return 1; }
+    [[ $got != *DISPLAY=:0* && $got != *XAUTHORITY* && $got != *QT_QPA_PLATFORM=xcb* && $got != *SESSION_MANAGER* ]] || { echo "$got"; return 1; }
+}
+x11_session() {
+    local got
+    got=$(session_env $'DISPLAY=:1\nXAUTHORITY=/home/x/.Xauthority\nXDG_CURRENT_DESKTOP=XFCE')
+    [[ $got == *DISPLAY=:1* && $got == *XAUTHORITY=/home/x/.Xauthority* && $got == *QT_QPA_PLATFORM=xcb* ]] || { echo "$got"; return 1; }
+}
+check "Wayland session: Wayland only, no DISPLAY, any desktop" wayland_session
+check "X11 session: DISPLAY, XAUTHORITY and the xcb platform" x11_session
+check "no desktop at all is refused by the startup check" bash -c \
+    "source <(sed -n '/^have_display()/,/^}/p' share/pirate-netns); ! WAYLAND_DISPLAY= DISPLAY= have_display"
+check "an X11 display with its socket file is accepted" bash -c \
+    "source <(sed -n '/^have_display()/,/^}/p' share/pirate-netns); n=\$(ls /tmp/.X11-unix 2>/dev/null | head -1); [[ -z \$n ]] || WAYLAND_DISPLAY= DISPLAY=:\${n#X}.0 have_display"
+
 echo "settings file"
 check "a setting saves and reads back" pz 'ensure_config; set_config COUNTRY NL; [[ $(get_config COUNTRY) == NL ]]'
 check "FORWARD=plain is kept" pz 'ensure_config; set_config FORWARD plain; ensure_forward; [[ $(get_config FORWARD) == plain ]]'

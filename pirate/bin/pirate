@@ -20,6 +20,7 @@ QBT_USER=pirate
 PROTON_CACHE=$HOME/.cache/Proton/VPN/serverlist.json
 USER_UNIT=$HOME/.config/systemd/user/pirate-session.service
 DESKTOP_OVERRIDE=$HOME/.local/share/applications/org.qbittorrent.qBittorrent.desktop
+AUTOSTART=${XDG_CONFIG_HOME:-$HOME/.config}/autostart/pirate.desktop
 SESSION_ENV=/run/user/$UID/pirate/session.env
 UNITS=(pirate-netns.service pirate-vpnd.service pirate-qbittorrent.service pirate-servers.service)
 USER_UNITS=(pirate-session.service pirate-servers-refresh.service pirate-servers-refresh.timer)
@@ -251,15 +252,29 @@ EOF
 
 # ---------- session ----------
 
-write_session_env() {  # session variables qBittorrent needs (never SESSION_MANAGER / DISPLAY)
-    local line
+# Session variables qBittorrent needs, taken from the desktop session (never SESSION_MANAGER).
+# On Wayland it runs as a Wayland app and never sees DISPLAY; only a plain X11 session passes DISPLAY.
+write_session_env() {
+    local line wayland="" display="" xauth=""
     mkdir -p -m 700 ${SESSION_ENV:h}
     {
         for line in ${(f)"$(systemctl --user show-environment 2>/dev/null)"}; do
-            [[ $line == (WAYLAND_DISPLAY|XDG_CURRENT_DESKTOP|XDG_SESSION_DESKTOP|XDG_SESSION_TYPE|XDG_DATA_DIRS|XDG_CONFIG_DIRS|KDE_[A-Z_]##|LANG|LANGUAGE|LC_[A-Z]##|XCURSOR_[A-Z]##|QT_[A-Z_]##|GTK_[A-Z_]##)=* ]] || continue
-            [[ $line == QT_WAYLAND_RECONNECT=* || $line == *[\"\'\\]* ]] && continue
-            print -r -- $line
+            [[ $line == *[\"\'\\]* || $line == (QT_WAYLAND_RECONNECT|QT_QPA_PLATFORM)=* ]] && continue
+            case $line in
+                WAYLAND_DISPLAY=?*) wayland=${line#*=} ;;
+                DISPLAY=?*)         display=${line#*=}; continue ;;
+                XAUTHORITY=?*)      xauth=$line; continue ;;
+            esac
+            [[ $line == (WAYLAND_DISPLAY|XDG_CURRENT_DESKTOP|XDG_SESSION_DESKTOP|XDG_SESSION_TYPE|XDG_DATA_DIRS|XDG_CONFIG_DIRS|KDE_[A-Z_]##|LANG|LANGUAGE|LC_[A-Z]##|XCURSOR_[A-Z]##|QT_[A-Z_]##|GTK_[A-Z_]##)=* ]] &&
+                print -r -- $line
         done
+        if [[ -n $wayland ]]; then
+            print QT_QPA_PLATFORM=wayland
+        elif [[ -n $display ]]; then
+            print -r -- "DISPLAY=$display"
+            [[ -n $xauth ]] && print -r -- $xauth
+            print QT_QPA_PLATFORM=xcb
+        fi
     } > $SESSION_ENV.tmp && mv -f $SESSION_ENV.tmp $SESSION_ENV
 }
 
@@ -300,17 +315,50 @@ cmd_open() {
 
 # ---------- setup steps ----------
 
-step_deps() {
-    local -A pkg=(wg wireguard-tools natpmpc libnatpmp jq jq curl curl nsenter util-linux setpriv util-linux
-                  notify-send libnotify bwrap bubblewrap qbittorrent qbittorrent python3 python
-                  kwriteconfig6 kconfig update-desktop-database desktop-file-utils)
-    local cmd missing=()
-    for cmd in ${(k)pkg}; do (( $+commands[$cmd] )) || missing+=$pkg[$cmd]; done
-    if (( $#missing )); then
-        bold "Installing missing packages: ${(u)missing}"
-        run_sudo pacman -S --needed --noconfirm ${(u)missing} || die "package install failed"
+# command pirate needs → the package that has it, per package manager (names checked on Arch,
+# Debian 13, Ubuntu 24.04 and Fedora 42)
+typeset -gA PKG_PACMAN=(wg wireguard-tools natpmpc libnatpmp jq jq curl curl nsenter util-linux setpriv util-linux
+    notify-send libnotify bwrap bubblewrap qbittorrent qbittorrent python3 python
+    update-desktop-database desktop-file-utils modinfo kmod)
+typeset -gA PKG_APT=(wg wireguard-tools natpmpc natpmpc jq jq curl curl nsenter util-linux setpriv util-linux
+    notify-send libnotify-bin bwrap bubblewrap qbittorrent qbittorrent python3 python3
+    update-desktop-database desktop-file-utils modinfo kmod)
+typeset -gA PKG_DNF=(wg wireguard-tools natpmpc libnatpmp jq jq curl curl nsenter util-linux setpriv util-linux
+    notify-send libnotify bwrap bubblewrap qbittorrent qbittorrent python3 python3
+    update-desktop-database desktop-file-utils modinfo kmod)
+
+package_manager() {
+    if (( $+commands[pacman] )); then print pacman
+    elif (( $+commands[apt-get] )); then print apt
+    elif (( $+commands[dnf] )); then print dnf
     fi
-    modinfo wireguard &>/dev/null || die "the wireguard kernel module is missing"
+}
+
+missing_packages() {  # pacman|apt|dnf — packages to install for the commands this system lacks
+    local -A pkg=("${(@kvP)${:-PKG_${(U)1}}}")
+    local cmd out=()
+    for cmd in ${(k)pkg}; do (( $+commands[$cmd] )) || out+=$pkg[$cmd]; done
+    print -r -- ${(u)out}
+}
+
+step_deps() {
+    local pm=$(package_manager) missing
+    if [[ -z $pm ]]; then
+        local cmd lacking=()
+        for cmd in ${(k)PKG_PACMAN}; do (( $+commands[$cmd] )) || lacking+=$cmd; done
+        (( $#lacking )) && die "no pacman, apt or dnf here: install whatever provides these commands, then run pirate again: $lacking"
+    else
+        missing=($(missing_packages $pm))
+        if (( $#missing )); then
+            bold "Installing missing packages: $missing"
+            case $pm in
+                pacman) run_sudo pacman -S --needed --noconfirm $missing ;;
+                apt)    run_sudo apt-get install -y $missing ;;
+                dnf)    run_sudo dnf install -y $missing ;;
+            esac || die "package install failed"
+        fi
+    fi
+    modinfo wireguard &>/dev/null || [[ -d /sys/module/wireguard ]] || die "the wireguard kernel module is missing"
     ok "dependencies installed"
 }
 
@@ -555,10 +603,19 @@ step_desktop() {
     else
         mv -f $tmp $DESKTOP_OVERRIDE
         update-desktop-database ${DESKTOP_OVERRIDE:h} &>/dev/null
-        kbuildsycoca6 &>/dev/null
+        (( $+commands[kbuildsycoca6] )) && kbuildsycoca6 &>/dev/null
     fi
     ok "app menu and magnet links open qBittorrent inside the VPN"
     rm -f $HOME/.config/autostart/qbittorrent.desktop
+    # for desktops that never start graphical-session.target (pirate-session.service covers the rest;
+    # starting twice is harmless)
+    mkdir -p ${AUTOSTART:h}
+    print -r -- "[Desktop Entry]
+Type=Application
+Name=pirate
+Comment=Start qBittorrent inside the VPN
+Exec=$PIRATE_BIN session-start
+NoDisplay=true" > $AUTOSTART
 
     local u reload=0
     for u in $USER_UNITS; do
@@ -572,10 +629,12 @@ step_desktop() {
     systemctl --user is-enabled -q pirate-servers-refresh.timer || systemctl --user enable -q --now pirate-servers-refresh.timer
     ok "the server list refreshes itself once it's $SERVERS_MAX_AGE days old (checked weekly)"
 
-    ex=$(kreadconfig6 --file ksmserverrc --group General --key excludeApps)
-    [[ ,$ex, == *,qbittorrent,* ]] ||
-        kwriteconfig6 --file ksmserverrc --group General --key excludeApps "${ex:+$ex,}qbittorrent"
-    ok "KDE won't restore qBittorrent outside the VPN at login"
+    if (( $+commands[kreadconfig6] && $+commands[kwriteconfig6] )); then   # KDE restores apps at login; GNOME doesn't
+        ex=$(kreadconfig6 --file ksmserverrc --group General --key excludeApps)
+        [[ ,$ex, == *,qbittorrent,* ]] ||
+            kwriteconfig6 --file ksmserverrc --group General --key excludeApps "${ex:+$ex,}qbittorrent"
+        ok "KDE won't restore qBittorrent outside the VPN at login"
+    fi
 
     ensure_forward
 }
@@ -697,7 +756,8 @@ cmd_doctor() {
     check "login unit enabled" "systemctl --user is-enabled -q pirate-session.service" "run 'pirate'"
     check "qBittorrent settings (wgpirate binding, WebUI login)" "qbt_conf check" "run 'pirate'"
     check "app menu entry goes through pirate" "grep -q '^Exec=.*pirate open' $DESKTOP_OVERRIDE" "run 'pirate'"
-    check "KDE session restore excludes qBittorrent" "[[ ,\$(kreadconfig6 --file ksmserverrc --group General --key excludeApps), == *,qbittorrent,* ]]" "run 'pirate'"
+    (( $+commands[kreadconfig6] )) &&
+        check "KDE session restore excludes qBittorrent" "[[ ,\$(kreadconfig6 --file ksmserverrc --group General --key excludeApps), == *,qbittorrent,* ]]" "run 'pirate'"
     check "no qBittorrent outside the VPN" "[[ -z \$(host_qbt_pids) ]]" "close it and use 'pirate open'"
     check "Proton VPN app not connected" "[[ ! -e /sys/class/net/proton0 ]]" "disconnect it"
     print
@@ -857,9 +917,12 @@ cmd_uninstall() {
     rm -f ${USER_UNIT:h}/${^USER_UNITS} $DESKTOP_OVERRIDE $STATE_DIR/{tests-passed,request}(N)
     systemctl --user daemon-reload
     update-desktop-database ${DESKTOP_OVERRIDE:h} &>/dev/null
-    kbuildsycoca6 &>/dev/null
-    local ex=$(kreadconfig6 --file ksmserverrc --group General --key excludeApps)
-    kwriteconfig6 --file ksmserverrc --group General --key excludeApps "${${(j:,:)${(s:,:)ex}:#qbittorrent}}"
+    rm -f $AUTOSTART
+    if (( $+commands[kreadconfig6] && $+commands[kwriteconfig6] )); then
+        (( $+commands[kbuildsycoca6] )) && kbuildsycoca6 &>/dev/null
+        local ex=$(kreadconfig6 --file ksmserverrc --group General --key excludeApps)
+        kwriteconfig6 --file ksmserverrc --group General --key excludeApps "${${(j:,:)${(s:,:)ex}:#qbittorrent}}"
+    fi
     ok "pirate removed (your WireGuard config was in $ETC and is gone — download a new one to reinstall)"
     local restored=0
     if [[ -f $QBT_CONF.bak-pirate-v3 ]]; then
