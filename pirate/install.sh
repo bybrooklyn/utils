@@ -70,6 +70,15 @@ else
     ask "Keep going anyway?" n || exit 1
 fi
 
+if [[ $(readlink -f /etc/resolv.conf) == /run/systemd/resolve/* ]]; then
+    ok "systemd-resolved handles DNS"
+else
+    warn "/etc/resolv.conf doesn't point at systemd-resolved"
+    say  "    pirate keeps qBittorrent's DNS inside the VPN through systemd-resolved, so it won't set up without it."
+    say  "    Ubuntu and Fedora have it on already. On Debian: sudo apt install systemd-resolved, reboot, run this again."
+    exit 1
+fi
+
 if [[ -e /sys/class/net/proton0 ]]; then
     warn "the Proton VPN app is connected right now"
     say  "    Disconnect it. Running both at once can break pirate's tunnel."

@@ -127,6 +127,8 @@ check "Debian/Ubuntu get the natpmpc package" missing_on apt natpmpc
 check "Debian/Ubuntu get libnotify-bin" missing_on apt libnotify-bin
 check "Fedora gets natpmpc from libnatpmp" missing_on dnf libnatpmp
 check "nothing to install when every command is there" pz '[[ -z $(missing_packages pacman) ]]'
+check "DNS through systemd-resolved is accepted" pz "ln -sf /run/systemd/resolve/stub-resolv.conf $T/rc; RESOLV_CONF=$T/rc resolved_dns"
+check "a plain /etc/resolv.conf is refused" pz "echo 'nameserver 1.1.1.1' > $T/rc2; ! RESOLV_CONF=$T/rc2 resolved_dns"
 
 echo "desktop session"
 session_env() {  # fake `systemctl --user show-environment` output → what qBittorrent gets
