@@ -43,14 +43,11 @@ export PATH="$BUN_INSTALL/bin:$PATH"
 #export PATH="$HOME/.local/bin:$PATH"
 #alias killdict='systemctl --user stop ydotoold.service; pkill -f ydotool; pkill -f dictation_app.py; pkill -f parakeet'
 
-export PATH="$HOME/.local/bin:$PATH"
 
 # >>> Codex installer >>>
 export PATH="/home/brook/.local/bin:$PATH"
 # <<< Codex installer <<<
-export LD_LIBRARY_PATH=$HOME/.local/lib:$LD_LIBRARY_PATH
-export LD_LIBRARY_PATH="$HOME/.local/lib:$LD_LIBRARY_PATH"
-export PATH="$HOME/.local/bin:$PATH"
+export LD_LIBRARY_PATH="$HOME/.local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 # >>> termium >>>
 case ":$PATH:" in *:'/home/brook/.local/bin':*) ;; *) export PATH='/home/brook/.local/bin':"$PATH" ;; esac
