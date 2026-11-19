@@ -1,0 +1,19 @@
+{
+  "MaxTier": 2,
+  "LogicalServers": [
+    { "Name": "TEST-NY#1", "ExitCountry": "US", "City": "New York", "Tier": 2, "Status": 1, "Features": 4, "Score": 1.5,
+      "Servers": [ { "Status": 1, "EntryIP": "192.0.2.10", "X25519PublicKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" } ] },
+    { "Name": "TEST-NY#2", "ExitCountry": "US", "City": "New York", "Tier": 2, "Status": 1, "Features": 4, "Score": 2.5,
+      "Servers": [ { "Status": 1, "EntryIP": "192.0.2.10", "X25519PublicKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" } ] },
+    { "Name": "TEST-NL#1", "ExitCountry": "NL", "City": "Amsterdam", "Tier": 2, "Status": 1, "Features": 12, "Score": 1.0,
+      "Servers": [ { "Status": 1, "EntryIP": "192.0.2.20", "X25519PublicKey": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=" } ] },
+    { "Name": "TEST-CH-US#1", "ExitCountry": "US", "City": "Zurich", "Tier": 2, "Status": 1, "Features": 5, "Score": 0.5,
+      "Servers": [ { "Status": 1, "EntryIP": "192.0.2.30", "X25519PublicKey": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=" } ] },
+    { "Name": "TEST-TOR#1", "ExitCountry": "US", "City": "Tor", "Tier": 2, "Status": 1, "Features": 6, "Score": 0.5,
+      "Servers": [ { "Status": 1, "EntryIP": "192.0.2.40", "X25519PublicKey": "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD=" } ] },
+    { "Name": "TEST-PLAIN#1", "ExitCountry": "US", "City": "Plain", "Tier": 2, "Status": 1, "Features": 0, "Score": 0.5,
+      "Servers": [ { "Status": 1, "EntryIP": "192.0.2.50", "X25519PublicKey": "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE=" } ] },
+    { "Name": "TEST-DOWN#1", "ExitCountry": "US", "City": "Down", "Tier": 2, "Status": 0, "Features": 4, "Score": 0.5,
+      "Servers": [ { "Status": 1, "EntryIP": "192.0.2.60", "X25519PublicKey": "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF=" } ] }
+  ]
+}

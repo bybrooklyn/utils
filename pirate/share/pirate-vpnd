@@ -410,4 +410,4 @@ main() {
     done
 }
 
-main "$@"
+[[ -n ${PIRATE_SOURCED:-} ]] || main "$@"   # tests load the functions without starting the daemon

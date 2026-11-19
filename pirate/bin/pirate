@@ -572,10 +572,12 @@ step_desktop() {
         kwriteconfig6 --file ksmserverrc --group General --key excludeApps "${ex:+$ex,}qbittorrent"
     ok "KDE won't restore qBittorrent outside the VPN at login"
 
-    # keep a FORWARD you chose; only fill it in when it's missing or invalid
-    if [[ $(get_config FORWARD) != (bwrap|plain) ]]; then
-        if bwrap --unshare-net --dev-bind / / true 2>/dev/null; then set_config FORWARD bwrap; else set_config FORWARD plain; fi
-    fi
+    ensure_forward
+}
+
+ensure_forward() {  # keep a FORWARD you chose; only fill it in when it's missing or invalid
+    [[ $(get_config FORWARD) == (bwrap|plain) ]] && return 0
+    if bwrap --unshare-net --dev-bind / / true 2>/dev/null; then set_config FORWARD bwrap; else set_config FORWARD plain; fi
 }
 
 step_finish() {
@@ -828,6 +830,8 @@ usage: pirate [command]
   uninstall               remove pirate
 EOF
 }
+
+[[ -n ${PIRATE_SOURCED:-} ]] && return 0   # tests load the functions without running a command
 
 case ${1:-setup} in
     setup|up)       shift $(( $# > 0 )); cmd_setup "$@" ;;
