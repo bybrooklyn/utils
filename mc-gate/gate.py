@@ -185,6 +185,11 @@ def poll_once():
                 s.starting_since = 0.0
         else:
             s.online, s.ready = 0, False
+            if s.starting_since and time.time() - s.starting_since > 300:
+                # asked Crafty to start it 5 minutes ago and it is still not running: the start failed
+                log.warning("%s did not start within 5 minutes; check it in Crafty", s.name)
+                notify("Minecraft server did not start", f"{s.name} was woken up but did not start. Check it in Crafty.")
+                s.starting_since = 0.0
         if sid not in state["known"]:
             state["known"].append(sid); save_state()
             addr = f"{s.slug}.{CONFIG['DOMAIN']}"
