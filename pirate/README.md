@@ -20,6 +20,7 @@ Claude Opus wrote the code.
 - **It sends desktop notifications** when something is actually wrong, like an expired config.
 - **It keeps its own log.** Every port change, server switch and killed qBittorrent goes in `/var/lib/pirate/events.log`, and `pirate logs` shows it.
 - **No Proton app needed to connect, no login.** One WireGuard key works on every Proton server.
+- **MyAnonamouse keeps up with the VPN.** MAM ties your seedbox session to an IP, and the VPN's IP changes every time pirate connects or switches servers. pirate tells MAM the new one each time, from inside the tunnel, and warns you if MAM stops accepting it.
 
 ## What you need
 
@@ -98,6 +99,9 @@ Open qBittorrent from the app menu like you always did. Magnet links work too. T
 | `pirate server refresh` | get a fresh server list from the Proton app |
 | `pirate reconnect` | fresh handshake with the server you're on |
 | `pirate config FILE` | install a new or renewed WireGuard config |
+| `pirate mam set` | give pirate your MyAnonamouse session (asks for the mam_id, or `--from FILE`) |
+| `pirate mam status` | did MAM take the VPN's current IP |
+| `pirate mam update`, `mam remove` | send the IP to MAM now, or forget the session |
 | `pirate start`, `stop`, `restart [--hard]` | control the services, no password needed |
 | `pirate logs` | the last 50 things it did, then live. `--journal` for the full system log. |
 | `pirate uninstall` | remove all of it |
@@ -144,6 +148,16 @@ Hit **Extend** on the config in Proton's dashboard, or make a new one the same w
 pirate config ~/Downloads/your-new-config.conf
 ```
 
+## MyAnonamouse
+
+MAM wants to know which IP your seedbox uses, and the VPN's IP changes whenever pirate connects or switches servers. So pirate tells MAM every time it changes.
+
+1. In MyAnonamouse, go to Preferences → Security and create a session. Lock it to the ASN (the VPN's network) rather than one IP, and tick "Allow session to set dynamic seedbox".
+2. Copy the mam_id it shows and run `pirate mam set`. It asks for it without echoing, saves it as `/etc/pirate/mam` (root only) and sends the first update.
+3. `pirate mam status` shows the IP MAM has.
+
+After that it runs by itself. pirate-vpnd calls MAM's dynamic seedbox page from inside the tunnel, so MAM sees the VPN's IP, whenever that IP changes and once a day to keep the session alive. MAM only takes one change an hour, so a second switch inside an hour waits. When MAM hands back a refreshed cookie, pirate saves it. The mam_id never goes on a command line, into a log or into `pirate status`.
+
 ## When something's wrong
 
 - **Run `pirate` first.** It repairs almost everything.
@@ -153,6 +167,7 @@ pirate config ~/Downloads/your-new-config.conf
 - **"stopped unprotected qBittorrent"** means you started qBittorrent some way other than the app menu or `pirate open`. Use those.
 - **qBittorrent didn't open at login.** Check `pirate status`. If the tunnel was down when you logged in, pirate won't start qBittorrent outside it. `pirate start` fixes it.
 - **"server list not refreshed"** means the Proton app opened but didn't update its list, usually because it's signed out. Open it, sign in, run `pirate server refresh`.
+- **"MyAnonamouse rejected the seedbox update"** means MAM turned the session down. If it's ASN-locked, the VPN may have moved to a server on another network. Make a new session in MAM and run `pirate mam set`.
 - **`pirate logs`** shows what it did recently and what it's doing now.
 
 ## Uninstall
@@ -211,7 +226,7 @@ pirate installs what's missing itself with pacman, apt or dnf. Anywhere else, in
 bash tests/run.sh
 ```
 
-45 checks, about 15 seconds, no root and no network. They cover qBittorrent's settings in both the 5.2 and 5.3 layouts, reading Proton configs, building the server list, the settings file, what gets sent to qBittorrent, the event log, packages on each distro, Wayland and X11 sessions, the server refresh, and the guard killing a fake qBittorrent outside the VPN.
+54 checks, about 15 seconds, no root and no network. They cover qBittorrent's settings in both the 5.2 and 5.3 layouts, reading Proton configs, building the server list, the settings file, what gets sent to qBittorrent, the event log, packages on each distro, Wayland and X11 sessions, the server refresh, the MyAnonamouse updates against faked MAM replies, and the guard killing a fake qBittorrent outside the VPN.
 
 ## Limits
 
