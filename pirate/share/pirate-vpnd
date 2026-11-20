@@ -317,10 +317,10 @@ mam_token_read() {  # prints the stored cookie value, or fails
     [[ $t =~ ^[A-Za-z0-9%_.~-]{20,}$ ]] && printf '%s\n' "$t"
 }
 
-# Runs the request through the VPN with the VPN's DNS (`ip netns exec` bind-mounts
-# /etc/netns/pirate/resolv.conf; plain nsx would resolve the name outside the tunnel).
+# Runs the request inside the VPN. The name is looked up with DNS-over-HTTPS to 1.1.1.1, which
+# also goes through the tunnel, so it doesn't depend on Proton's DNS answering on every server.
 mam_curl() {  # cookie-jar → prints MAM's reply
-    ip netns exec pirate curl -sS --max-time 20 -b "$1" -c "$1" "$MAM_URL"
+    nsx curl -sS --max-time 20 --doh-url https://1.1.1.1/dns-query -b "$1" -c "$1" "$MAM_URL"
 }
 
 mam_status_write() {  # state message
