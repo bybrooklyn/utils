@@ -299,6 +299,119 @@ leak_guard() {
     done
 }
 
+# ---------- MyAnonamouse dynamic seedbox ----------
+# MAM ties a seedbox session to an IP. Whenever the VPN's public IP changes, tell MAM from inside
+# the VPN (so it sees that IP) using the session cookie in /etc/pirate/mam (root only, `pirate mam set`).
+# MAM accepts one change per hour and may hand back a refreshed cookie, which replaces the stored one.
+# The cookie never goes on a command line, into a log or into /run/pirate.
+
+MAM_TOKEN=$ETC/mam
+MAM_STATE=$STATE/mam.state       # "last_ip last_ok_epoch" (no secrets), survives restarts
+MAM_URL=https://t.myanonamouse.net/json/dynamicSeedbox.php
+MAM_KEEPALIVE=86400              # re-confirm daily even without an IP change
+MAM_COOLDOWN=3600                # MAM's "Last change too recent" window
+
+mam_token_read() {  # prints the stored cookie value, or fails
+    local t
+    t=$(sed -n 's/^mam_id=//p' "$MAM_TOKEN" 2>/dev/null | head -1)
+    [[ $t =~ ^[A-Za-z0-9%_.~-]{20,}$ ]] && printf '%s\n' "$t"
+}
+
+# Runs the request through the VPN with the VPN's DNS (`ip netns exec` bind-mounts
+# /etc/netns/pirate/resolv.conf; plain nsx would resolve the name outside the tunnel).
+mam_curl() {  # cookie-jar → prints MAM's reply
+    ip netns exec pirate curl -sS --max-time 20 -b "$1" -c "$1" "$MAM_URL"
+}
+
+mam_status_write() {  # state message
+    put mam "state=$1
+ip=$mam_last_ip
+last_ok=$mam_last_ok
+next_try=$mam_next_try
+msg=$2"
+}
+
+mam_state_load() {
+    local ip="" ok=""
+    [[ -r $MAM_STATE ]] && read -r ip ok <"$MAM_STATE"
+    [[ $ip =~ ^[0-9.]+$ ]] && mam_last_ip=$ip || mam_last_ip=""
+    [[ $ok =~ ^[0-9]+$ ]] && mam_last_ok=$ok || mam_last_ok=0
+}
+
+mam_sync() {
+    local m token ip now=$EPOCHSECONDS forced=0 jar reply ok msg fresh
+    if [[ ! -e $MAM_TOKEN ]]; then
+        [[ -e $RUN/mam ]] && rm -f "$RUN/mam"
+        mam_tok_mtime="" mam_rejected=0 want_mam=0
+        return 0
+    fi
+    m=$(stat -c %Y "$MAM_TOKEN" 2>/dev/null || echo 0)
+    if [[ $m != "$mam_tok_mtime" ]]; then   # new or replaced token: start over
+        [[ -n $mam_tok_mtime ]] && log "mam: token changed"
+        mam_tok_mtime=$m mam_rejected=0 mam_fails=0 mam_next_try=0 forced=1 mam_notified=0
+    fi
+    ((want_mam)) && forced=1
+    if ! token=$(mam_token_read); then
+        ((mam_rejected)) || { warn "mam: $MAM_TOKEN doesn't hold a valid mam_id"; mam_status_write invalid "the stored token is malformed — run 'pirate mam set'"; }
+        mam_rejected=1 want_mam=0
+        return 0
+    fi
+    [[ $state == connected ]] || return 0
+    ip=$(cat "$RUN/public_ip" 2>/dev/null)
+    [[ $ip =~ ^[0-9.]+$ ]] || return 0
+    [[ -e $RUN/mam ]] || mam_status_write waiting "waiting for the first update"
+
+    if ((!forced)); then
+        ((mam_rejected)) && return 0                       # until the token changes or `pirate mam update`
+        ((now < mam_next_try)) && return 0
+        [[ $ip != "$mam_last_ip" ]] || ((now - mam_last_ok >= MAM_KEEPALIVE)) || return 0
+    fi
+    want_mam=0
+
+    jar=$(umask 077; mktemp "$RUN/mam.jar.XXXXXX") || return 0
+    printf '.myanonamouse.net\tTRUE\t/\tTRUE\t0\tmam_id\t%s\n' "$token" >"$jar"
+    reply=$(mam_curl "$jar" 2>&1)
+    fresh=$(awk -F'\t' '$6 == "mam_id" { v = $7 } END { print v }' "$jar" 2>/dev/null)
+    rm -f "$jar"
+
+    ok=$(jq -r 'if type == "object" then (.Success | tostring) else empty end' <<<"$reply" 2>/dev/null)
+    msg=$(jq -r 'if type == "object" then (.msg // "") else empty end' <<<"$reply" 2>/dev/null | tr -cd '[:print:]' | cut -c1-120)
+
+    if [[ $fresh =~ ^[A-Za-z0-9%_.~-]{20,}$ && $fresh != "$token" ]]; then   # MAM rotated the cookie
+        (umask 077; printf 'mam_id=%s\n' "$fresh" >"$MAM_TOKEN.tmp") && mv -f "$MAM_TOKEN.tmp" "$MAM_TOKEN" &&
+            mam_tok_mtime=$(stat -c %Y "$MAM_TOKEN" 2>/dev/null || echo 0)
+    fi
+
+    if [[ $ok == true ]]; then
+        if [[ $msg == "No change" ]]; then log "mam: no change ($ip already registered)"
+        else log "mam: seedbox IP set to $ip"; fi
+        mam_last_ip=$ip mam_last_ok=$now mam_fails=0 mam_next_try=0 mam_notified=0
+        echo "$mam_last_ip $mam_last_ok" >"$MAM_STATE"
+        mam_status_write ok "${msg:-done}"
+    elif [[ $ok == false && $msg == *"too recent"* ]]; then
+        mam_next_try=$((now + MAM_COOLDOWN))
+        log "mam: MAM allows one change per hour, retrying at $(date -d "@$mam_next_try" +%H:%M)"
+        mam_status_write cooldown "$msg"
+    elif [[ $ok == false ]]; then
+        mam_rejected=1
+        warn "mam: rejected (${msg:-no reason given})"
+        mam_status_write rejected "${msg:-rejected}"
+        if ((!mam_notified)); then
+            notify critical "pirate: MyAnonamouse rejected the seedbox update" \
+                "MAM said: ${msg:-rejected}. If the session is ASN-locked, the VPN may have moved to another network. Make a new session and run: pirate mam set"
+            mam_notified=1
+        fi
+    else
+        mam_fails=$((mam_fails + 1))
+        local delay=300
+        ((mam_fails >= 2)) && delay=900
+        ((mam_fails >= 3)) && delay=3600
+        mam_next_try=$((now + delay))
+        warn "mam: no answer from MAM ($(tail -1 <<<"$reply" | tr -cd '[:print:]' | cut -c1-100)), retrying in $((delay / 60)) min"
+        mam_status_write error "no answer from MAM, retrying in $((delay / 60)) min"
+    fi
+}
+
 # ---------- requests from `pirate` ----------
 
 check_requests() {
@@ -316,6 +429,7 @@ check_requests() {
     if [[ $m != "$req_mtime" ]]; then
         req_mtime=$m
         grep -q '^reconnect' "$REQUEST" 2>/dev/null && want_reconnect=1
+        grep -q '^mam' "$REQUEST" 2>/dev/null && want_mam=1
     fi
 }
 
@@ -334,6 +448,8 @@ main() {
     grace_until=$((EPOCHSECONDS + GRACE)) last_bump=0 qbt_disc=0
     expired_notified=0 degraded_notified=0 want_switch=0 want_reconnect=0
     dead_servers=() natpmp_refused=()
+    want_mam=0 mam_tok_mtime="" mam_rejected=0 mam_fails=0 mam_next_try=0 mam_notified=0
+    mam_state_load
     declare -gA warned_at=()   # pid of a qBittorrent outside the VPN → when it was asked to stop (0 = killed)
     load_user_config
     cfg_mtime=$(stat -c %Y "$USER_CONFIG" 2>/dev/null || echo 0)
@@ -446,6 +562,7 @@ main() {
         fi
 
         qbt_sync
+        mam_sync
         nap "$TICK"
     done
 }
