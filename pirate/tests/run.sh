@@ -201,6 +201,91 @@ guard_test() {
 }
 check "a qBittorrent outside the VPN that ignores SIGTERM gets killed" guard_test
 
+echo "MyAnonamouse"
+TOK=abcdefghijklmnopqrstuvwxyz0123456789_-AB
+check "a pasted mam_id= prefix and spaces are stripped" pz "[[ \$(mam_clean_token ' mam_id=$TOK ') == $TOK ]]"
+check "a token that isn't a mam_id is refused" pz "! mam_clean_token 'short' && ! mam_clean_token \"abc'def\$(id)ghijklmnopqrstuvwxyz\""
+mam_set_test() {
+    mkdir -p "$T/r"
+    echo "mam_id=$TOK" > "$T/r/pending"
+    local out
+    out=$(pz "
+        run_sudo() { [[ \$2 == -d ]] && return 0; install -m600 \"\${@: -2:1}\" '$T/r/installed'; }
+        mam_request_update() { :; }; mam_wait() { :; }
+        mam_set --from '$T/r/pending'" 2>&1) || { echo "$out"; return 1; }
+    [[ $(cat "$T/r/installed") == "mam_id=$TOK" ]] || { echo "installed: $(cat "$T/r/installed")"; return 1; }
+    [[ $(stat -c %a "$T/r/installed") == 600 ]] || { echo "mode $(stat -c %a "$T/r/installed")"; return 1; }
+    [[ ! -e $T/r/pending ]] || { echo "the --from file was left behind"; return 1; }
+    [[ $out != *"$TOK"* ]] || { echo "the token was printed"; return 1; }
+}
+check "mam set --from installs the token root-only, removes the file, never prints it" mam_set_test
+
+# the daemon side, with MAM faked: mam_curl prints a canned reply and counts calls
+pm() {  # reply-json bash-code
+    mkdir -p "$T/m/etc" "$T/m/run" "$T/m/st"
+    PIRATE_SOURCED=1 PIRATE_USER=$USER REPLY_JSON=$1 bash -c "
+        source share/pirate-vpnd
+        ETC=$T/m/etc RUN=$T/m/run STATE=$T/m/st EVENTS=$T/m/events
+        MAM_TOKEN=\$ETC/mam MAM_STATE=\$STATE/mam.state
+        log() { :; }; warn() { :; }; notify() { echo n >> $T/m/notified; }
+        mam_curl() { echo c >> $T/m/calls; [[ -n \${NEW_COOKIE:-} ]] && printf '.myanonamouse.net\tTRUE\t/\tTRUE\t0\tmam_id\t%s\n' \"\$NEW_COOKIE\" > \"\$1\"; printf '%s' \"\$REPLY_JSON\"; }
+        state=connected want_mam=0 mam_tok_mtime='' mam_rejected=0 mam_fails=0 mam_next_try=0 mam_notified=0
+        mam_state_load
+        echo 'mam_id=$TOK' > \$MAM_TOKEN; chmod 600 \$MAM_TOKEN
+        put public_ip 146.70.202.190
+        $2"
+}
+reset_m() { rm -rf "$T/m"; }
+calls() { [[ -f $T/m/calls ]] && wc -l < "$T/m/calls" || echo 0; }
+
+mam_ok_test() {
+    reset_m
+    pm '{"Success":true,"msg":"Completed"}' 'mam_sync; mam_sync' || return 1
+    grep -q '^state=ok$' "$T/m/run/mam" && grep -q '^ip=146.70.202.190$' "$T/m/run/mam" || { cat "$T/m/run/mam"; return 1; }
+    [[ $(cut -d' ' -f1 "$T/m/st/mam.state") == 146.70.202.190 ]] || return 1
+    [[ $(calls) == 1 ]] || { echo "calls: $(calls) (the unchanged IP should not be sent twice)"; return 1; }
+}
+check "MAM accepts the IP: status ok, remembered, not resent while unchanged" mam_ok_test
+
+mam_ipchange_test() {
+    reset_m
+    pm '{"Success":true,"msg":"Completed"}' 'mam_sync; put public_ip 89.187.1.2; mam_sync' || return 1
+    [[ $(calls) == 2 ]] && grep -q '^ip=89.187.1.2$' "$T/m/run/mam"
+}
+check "a new VPN IP is sent to MAM" mam_ipchange_test
+
+mam_cooldown_test() {
+    reset_m
+    pm '{"Success":false,"msg":"Last change too recent"}' 'mam_sync; mam_sync; ((mam_next_try >= EPOCHSECONDS + 3500))' || return 1
+    grep -q '^state=cooldown$' "$T/m/run/mam" && [[ $(calls) == 1 ]]
+}
+check "MAM's one-change-per-hour limit waits an hour" mam_cooldown_test
+
+mam_reject_test() {
+    reset_m
+    pm '{"Success":false,"msg":"Invalid session"}' 'mam_sync; put public_ip 89.187.1.2; mam_sync' || return 1
+    grep -q '^state=rejected$' "$T/m/run/mam" || return 1
+    [[ $(calls) == 1 ]] || { echo "kept calling after a rejection"; return 1; }
+    [[ $(wc -l < "$T/m/notified") == 1 ]] || { echo "notified $(wc -l < "$T/m/notified") times"; return 1; }
+}
+check "a rejected session notifies once and stops until the token changes" mam_reject_test
+
+mam_refresh_test() {
+    reset_m
+    NEW_COOKIE=zyxwvutsrqponmlkjihgfedcba9876543210 pm '{"Success":true,"msg":"No change"}' 'mam_sync' || return 1
+    [[ $(cat "$T/m/etc/mam") == mam_id=zyxwvutsrqponmlkjihgfedcba9876543210 ]] || { echo "token file: $(cat "$T/m/etc/mam")"; return 1; }
+    [[ $(stat -c %a "$T/m/etc/mam") == 600 ]] || return 1
+    ! grep -rq "$TOK\|zyxwvutsrqponmlkjihgfedcba" "$T/m/run" "$T/m/st" || { echo "the cookie leaked into status or state"; return 1; }
+}
+check "a refreshed cookie from MAM replaces the stored one (600) and never reaches status files" mam_refresh_test
+
+mam_noanswer_test() {
+    reset_m
+    pm 'curl: (6) Could not resolve host' 'mam_sync; mam_sync; ((mam_next_try >= EPOCHSECONDS + 250))' || return 1
+    grep -q '^state=error$' "$T/m/run/mam" && [[ $(calls) == 1 ]]
+}
+check "no answer from MAM retries later instead of every tick" mam_noanswer_test
+
 echo "installer"
 eval "$(sed -n '/^find_conf()/,/^}/p' install.sh)"
 finds_spaced_conf() {
