@@ -12,7 +12,7 @@ Claude Opus wrote the code.
 
 - **Only qBittorrent is on the VPN.** It lives in its own network namespace, a little box with exactly two network interfaces: loopback and the tunnel. Everything else on your computer never sees the VPN.
 - **It can't leak.** That box has no route out except the tunnel. If WireGuard dies, qBittorrent has no internet at all.
-- **No DNS leaks either.** qBittorrent asks Proton's DNS (10.2.0.1) and can't see your system's resolver.
+- **No DNS leaks either.** qBittorrent asks Proton's DNS (10.2.0.1), falling back to 1.1.1.1 when a Proton server's resolver doesn't answer. Both go through the tunnel, and qBittorrent can't see your system's resolver.
 - **Port forwarding that stays up.** pirate asks Proton for a forwarded port every 45 seconds and tells qBittorrent which one it got. That's the difference between downloading at full speed and sitting there "firewalled" with three peers.
 - **It switches servers on its own** when one stops answering or refuses port forwarding.
 - **It's always on.** The tunnel comes up at boot. qBittorrent starts when you log in, from the app menu, and from magnet links, always inside the tunnel.
@@ -226,7 +226,7 @@ pirate installs what's missing itself with pacman, apt or dnf. Anywhere else, in
 bash tests/run.sh
 ```
 
-54 checks, about 15 seconds, no root and no network. They cover qBittorrent's settings in both the 5.2 and 5.3 layouts, reading Proton configs, building the server list, the settings file, what gets sent to qBittorrent, the event log, packages on each distro, Wayland and X11 sessions, the server refresh, the MyAnonamouse updates against faked MAM replies, and the guard killing a fake qBittorrent outside the VPN.
+55 checks, about 15 seconds, no root and no network. They cover qBittorrent's settings in both the 5.2 and 5.3 layouts, reading Proton configs, building the server list, the settings file, what gets sent to qBittorrent, the event log, packages on each distro, Wayland and X11 sessions, the server refresh, the MyAnonamouse updates against faked MAM replies, and the guard killing a fake qBittorrent outside the VPN.
 
 ## Limits
 

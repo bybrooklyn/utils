@@ -161,8 +161,9 @@ have_display() {
 
 cmd_check_self() {  # [--no-gui]
     [[ $(stat -Lc %i /proc/self/ns/net) == "$(stat -Lc %i "$NSP")" ]] || die "not inside the pirate namespace"
-    [[ $(awk '$1 == "nameserver" { print $2 }' /etc/resolv.conf | sort -u | tr '\n' ' ') == "$GW " ]] ||
-        die "DNS isn't pointed at the VPN ($GW)"
+    # Proton's resolver, plus 1.1.1.1 as a fallback; both are only reachable through the tunnel
+    [[ $(awk '$1 == "nameserver" { print $2 }' /etc/resolv.conf | tr '\n' ' ') == "$GW 1.1.1.1 " ]] ||
+        die "DNS isn't pointed at the VPN ($GW, then 1.1.1.1 through the tunnel)"
     [[ ! -e /run/systemd/resolve/io.systemd.Resolve ]] || die "systemd-resolved socket is visible (DNS leak)"
     ! grep -Eq '^hosts:.*\bresolve\b' /etc/nsswitch.conf || die "nsswitch uses systemd-resolved (DNS leak)"
     [[ $(awk 'NR > 2 { sub(":", "", $1); print $1 }' /proc/net/dev | sort | tr '\n' ' ') == "lo $IF " ]] ||
@@ -191,7 +192,7 @@ cmd_doctor() {
     if ((${hs:-0} > 0 && $(date +%s) - hs < 180)); then pass "handshake $(($(date +%s) - hs))s ago"
     else flunk "no recent WireGuard handshake"; fi
 
-    if out=$("${sandbox[@]}" "$0" check-self --no-gui 2>&1); then pass "sandbox: DNS → $GW only, resolved socket hidden, nsswitch safe"
+    if out=$("${sandbox[@]}" "$0" check-self --no-gui 2>&1); then pass "sandbox: DNS → $GW (1.1.1.1 fallback), both through the tunnel, resolved socket hidden, nsswitch safe"
     else flunk "sandbox: $out"; fi
 
     host_ip=$(curl -4s --max-time 10 https://api.ipify.org || true)

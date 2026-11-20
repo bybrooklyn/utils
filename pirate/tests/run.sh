@@ -128,6 +128,7 @@ check "Debian/Ubuntu get libnotify-bin" missing_on apt libnotify-bin
 check "Fedora gets natpmpc from libnatpmp" missing_on dnf libnatpmp
 check "nothing to install when every command is there" pz '[[ -z $(missing_packages pacman) ]]'
 check "DNS through systemd-resolved is accepted" pz "ln -sf /run/systemd/resolve/stub-resolv.conf $T/rc; RESOLV_CONF=$T/rc resolved_dns"
+check "VPN DNS: Proton first, then 1.1.1.1, with a short timeout" pz '[[ $VPN_RESOLV == $'"'"'nameserver 10.2.0.1\nnameserver 1.1.1.1\noptions timeout:2 attempts:1'"'"' ]]'
 check "a plain /etc/resolv.conf is refused" pz "echo 'nameserver 1.1.1.1' > $T/rc2; ! RESOLV_CONF=$T/rc2 resolved_dns"
 
 echo "desktop session"

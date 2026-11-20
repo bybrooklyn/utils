@@ -15,6 +15,10 @@ NSP=/run/netns/pirate
 CONFIG_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/pirate
 CONFIG=$CONFIG_DIR/config
 STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/pirate
+# DNS inside the VPN: Proton's resolver first, then Cloudflare. Both are reached through the tunnel
+# (the namespace has no other route), so the fallback can't leak. Proton's 10.2.0.1 doesn't answer
+# on every server; with a 2 s timeout a dead one costs one short wait instead of every lookup failing.
+VPN_RESOLV=$'nameserver 10.2.0.1\nnameserver 1.1.1.1\noptions timeout:2 attempts:1'
 QBT_CONF=$HOME/.config/qBittorrent/qBittorrent.conf
 QBT_USER=pirate
 PROTON_CACHE=$HOME/.cache/Proton/VPN/serverlist.json
@@ -497,7 +501,7 @@ step_install() {
     for u in $UNITS; do render $SRC/$u > $stage/etc/systemd/system/$u; done
     render $SRC/50-pirate.rules > $stage/etc/polkit-1/rules.d/50-pirate.rules
     for f in etc/pirate/resolve/resolv.conf etc/pirate/resolve/stub-resolv.conf etc/netns/pirate/resolv.conf; do
-        print 'nameserver 10.2.0.1' > $stage/$f
+        print -r -- "$VPN_RESOLV" > $stage/$f
     done
     for f in etc/pirate/nsswitch.conf etc/netns/pirate/nsswitch.conf; do
         sed -E 's/^hosts:.*/hosts: files myhostname dns/' /etc/nsswitch.conf > $stage/$f
