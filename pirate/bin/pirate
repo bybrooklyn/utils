@@ -747,6 +747,7 @@ cmd_status() {
         else warn "WireGuard config imported $imported — Proton configs expire after about a year: use Extend in the Proton dashboard (or download a new one) and run 'pirate config <file>'"; fi
     fi
     [[ -e /sys/class/net/proton0 ]] && warn "the Proton VPN app is connected too — disconnect it, it can block pirate's tunnel"
+    if [[ -e $MAM_TOKEN ]]; then mam_status_line || healthy=0; fi
     (( healthy ))
 }
 
@@ -764,6 +765,8 @@ cmd_doctor() {
         check "KDE session restore excludes qBittorrent" "[[ ,\$(kreadconfig6 --file ksmserverrc --group General --key excludeApps), == *,qbittorrent,* ]]" "run 'pirate'"
     check "no qBittorrent outside the VPN" "[[ -z \$(host_qbt_pids) ]]" "close it and use 'pirate open'"
     check "Proton VPN app not connected" "[[ ! -e /sys/class/net/proton0 ]]" "disconnect it"
+    [[ -e $MAM_TOKEN ]] &&
+        check "MyAnonamouse token readable by root only" "[[ \$(stat -c '%a %U' $MAM_TOKEN) == '600 root' ]]" "run 'pirate mam set'"
     print
     bold "Leak tests (sudo)"
     run_sudo $LIB/pirate-netns doctor || problems=$((problems + 1))
@@ -940,6 +943,94 @@ cmd_uninstall() {
     fi
 }
 
+# ---------- MyAnonamouse ----------
+# pirate-vpnd tells MAM the VPN's IP whenever it changes (dynamic seedbox). The session cookie lives
+# in /etc/pirate/mam, readable by root only, and never goes on a command line.
+
+MAM_TOKEN=$ETC/mam
+
+mam_clean_token() {  # raw text → the bare mam_id value, or fail
+    local t=${1//[[:space:]]/}
+    t=${t#mam_id=}
+    [[ $t =~ '^[A-Za-z0-9%_.~-]{20,}$' ]] && print -r -- $t
+}
+
+mam_request_update() {
+    systemctl is-active -q pirate-vpnd.service || { warn "pirate-vpnd isn't running, so MAM will be updated when it starts"; return 0 }
+    mkdir -p $STATE_DIR
+    print -r -- "mam $EPOCHSECONDS" > $STATE_DIR/request
+    reload_daemon
+}
+
+mam_field() { sed -n "s/^$1=//p" $RUN/mam 2>/dev/null | head -1 }
+
+mam_status_line() {  # one line for `pirate status` / `pirate mam status`
+    local st=$(mam_field state) ip=$(mam_field ip) last=$(mam_field last_ok) next=$(mam_field next_try) msg=$(mam_field msg)
+    local when=""
+    (( ${last:-0} > 0 )) && when=", confirmed $(date -d @$last '+%b %-d %H:%M')"
+    case $st in
+        ok)       ok "MyAnonamouse: seedbox IP ${ip:-?}$when" ;;
+        cooldown) warn "MyAnonamouse: MAM allows one change per hour, retrying at $(date -d @${next:-0} +%H:%M)" ;;
+        rejected) fail "MyAnonamouse rejected the session (${msg:-no reason}) — make a new session and run 'pirate mam set'"; return 1 ;;
+        invalid)  fail "MyAnonamouse: the stored token is malformed — run 'pirate mam set'"; return 1 ;;
+        error)    warn "MyAnonamouse: ${msg:-no answer}" ;;
+        waiting)  warn "MyAnonamouse: waiting for the VPN before the first update" ;;
+        *)        warn "MyAnonamouse: token set, no update yet (pirate-vpnd sends one once connected)" ;;
+    esac
+}
+
+cmd_mam() {  # set [--from FILE] | status | update | remove
+    case ${1:-status} in
+        set)    shift; mam_set "$@" ;;
+        status) if [[ -e $MAM_TOKEN ]]; then mam_status_line
+                else warn "no MyAnonamouse token — run 'pirate mam set'"; fi ;;
+        update) [[ -e $MAM_TOKEN ]] || die "no MyAnonamouse token — run 'pirate mam set'"
+                mam_request_update; ok "asked pirate-vpnd to update MAM"; mam_wait ;;
+        remove) [[ -e $MAM_TOKEN ]] || { ok "no MyAnonamouse token to remove"; return 0 }
+                run_sudo rm -f $MAM_TOKEN || die "couldn't remove $MAM_TOKEN"
+                reload_daemon; ok "MyAnonamouse token removed" ;;
+        *)      die "usage: pirate mam [status | set [--from FILE] | update | remove]" ;;
+    esac
+}
+
+mam_wait() {  # show the result of a requested update (up to 30 s)
+    local before=$(mam_field last_ok) i
+    for i in {1..15}; do
+        sleep 2
+        [[ $(mam_field state) == (ok|cooldown|rejected|invalid|error) && ( $(mam_field last_ok) != $before || $(mam_field state) != ok ) ]] && break
+    done
+    mam_status_line
+}
+
+mam_set() {  # [--from FILE]
+    local from="" raw token tmp
+    if [[ ${1:-} == --from ]]; then
+        from=${2:-}
+        [[ -r $from ]] || die "usage: pirate mam set [--from FILE]"
+        raw=$(<$from)
+    elif have_tty; then
+        print "In MyAnonamouse: Preferences → Security → create a session (ASN-locked is best for a VPN),"
+        print "tick 'Allow session to set dynamic seedbox', and paste the mam_id it shows."
+        read -rs "raw?mam_id: "
+        print
+    else
+        raw=$(cat)
+    fi
+    token=$(mam_clean_token "$raw") || die "that doesn't look like a mam_id (letters, digits, - _ . ~ %, at least 20 long)"
+    tmp=$(umask 077; mktemp)
+    print -r -- "mam_id=$token" > $tmp
+    bold "Installing the MyAnonamouse token — sudo"
+    if ! run_sudo install -d -m755 -o root -g root $ETC || ! run_sudo install -m600 -o root -g root $tmp $MAM_TOKEN; then
+        rm -f $tmp
+        die "couldn't install the token"
+    fi
+    rm -f $tmp
+    [[ -n $from ]] && rm -f $from
+    ok "token installed as $MAM_TOKEN (readable by root only)"
+    mam_request_update
+    mam_wait
+}
+
 EVENTS=/var/lib/pirate/events.log
 
 cmd_logs() {  # [--journal]
@@ -964,6 +1055,8 @@ usage: pirate [command]
   server [CC|NAME|auto]   prefer a country (NL, CH, …) or pin a server; `server list [CC]`
   server refresh          get a fresh server list from the Proton VPN app (also runs on its own monthly)
   reconnect               fresh handshake with the current server
+  mam [status|set|update|remove]   MyAnonamouse session: pirate tells MAM the VPN's IP
+                          whenever it changes (set reads the mam_id from a prompt, stdin or --from FILE)
   config FILE             install a new/renewed Proton WireGuard config (sudo)
   start | stop | restart [--hard]   control the VPN services
   logs [--journal]        pirate's recent events, then follow (--journal: the full system log)
@@ -980,6 +1073,7 @@ case ${1:-setup} in
     open)           shift; cmd_open "$@" ;;
     server)         shift; cmd_server "$@" ;;
     reconnect)      cmd_reconnect ;;
+    mam)            shift; cmd_mam "$@" ;;
     config)         shift; cmd_config "$@" ;;
     start)          cmd_start ;;
     stop)           cmd_stop ;;
