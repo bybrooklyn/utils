@@ -85,10 +85,24 @@ def reading(v):
     return status, charge, runtime
 
 
+USABLE_WH = 0.0  # set from the config's USABLE_WH; 0 leaves the load estimate out
+
+
+def set_usable_wh(conf):
+    global USABLE_WH
+    try:
+        USABLE_WH = float(conf.get("USABLE_WH", 0) or 0)
+    except ValueError:
+        USABLE_WH = 0.0
+
+
 def describe(charge, runtime):
     s = f"{charge:.0f}%"
     if runtime >= 0:
         s += f", about {runtime // 60} min left"
+    if USABLE_WH > 0 and runtime > 0 and charge == charge:
+        # Many small UPSes report no load; their runtime estimate is the load in disguise.
+        s += f", about {USABLE_WH * charge / 100 / (runtime / 3600):.0f} W"
     return s
 
 
@@ -105,6 +119,7 @@ SERVER_DEFAULTS = {
     "LOWPRIO": "",            # containers kept up but at the lowest CPU weight while shed
     "RESTORE_AFTER": "60",    # seconds of steady mains before putting things back
     "POLL": "10",
+    "USABLE_WH": "0",         # usable battery energy, for a load estimate from the runtime (0: off)
     "STATE": "~/.local/state/ups-guard/shed.json",
 }
 
@@ -116,6 +131,7 @@ def docker_running(name):
 
 def server():
     c = load_conf(os.environ.get("UPS_GUARD_CONF", "~/.config/ups-guard/server.conf"), SERVER_DEFAULTS)
+    set_usable_wh(c)
     state_path = os.path.expanduser(c["STATE"])
     os.makedirs(os.path.dirname(state_path), exist_ok=True)
 
@@ -199,6 +215,7 @@ PC_DEFAULTS = {
     "COUNTDOWN": "60",        # seconds between the last warning and the power off
     "POWER_SAVE": "yes",      # power-saver profile and the GPU's minimum power limit while on battery
     "POLL": "10",
+    "USABLE_WH": "0",         # usable battery energy, for a load estimate from the runtime (0: off)
 }
 
 
@@ -281,6 +298,7 @@ class PowerSave:
 
 def pc():
     c = load_conf(os.environ.get("UPS_GUARD_CONF", "/etc/ups-guard/pc.conf"), PC_DEFAULTS)
+    set_usable_wh(c)
     d = Desktop(c["USER"])
     ps = PowerSave()
     off_at = float(c["OFF_AT"])
@@ -389,12 +407,15 @@ def countdown(c, d, flag):
 # ---------------------------------------------------------------- small commands
 
 def status_cmd():
-    spec = load_conf("/etc/ups-guard/pc.conf", PC_DEFAULTS)["UPS"]
+    c = load_conf("/etc/ups-guard/pc.conf", PC_DEFAULTS)
     if os.path.exists(os.path.expanduser("~/.config/ups-guard/server.conf")):
-        spec = load_conf("~/.config/ups-guard/server.conf", SERVER_DEFAULTS)["UPS"]
+        c = load_conf("~/.config/ups-guard/server.conf", SERVER_DEFAULTS)
+    set_usable_wh(c)
+    spec = c["UPS"]
     v = nut_vars(spec)
     status, charge, runtime = reading(v)
-    print(f"{spec}: {' '.join(status)}  {describe(charge, runtime)}  load {v.get('ups.load', '?')}%")
+    load = f"  load {v['ups.load']}%" if "ups.load" in v else ""
+    print(f"{spec}: {' '.join(status)}  {describe(charge, runtime)}{load}")
     flag = Desktop("").keep_flag()
     if flag:
         print("keep-on: " + ("set (this PC will not power off for the UPS)" if os.path.exists(flag) else "not set"))

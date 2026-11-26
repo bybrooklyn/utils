@@ -54,9 +54,13 @@ change (power out, services shed, PC powering off, power back), as context for t
 ## Config keys
 
 Server (`~/.config/ups-guard/server.conf`): `UPS` (ups@localhost), `SHED_AT` (90), `SHED`, `LOWPRIO`,
-`RESTORE_AFTER` (60 s), `POLL` (10 s), `STATE` (~/.local/state/ups-guard/shed.json).
+`RESTORE_AFTER` (60 s), `POLL` (10 s), `USABLE_WH` (0), `STATE` (~/.local/state/ups-guard/shed.json).
 
 PC (`/etc/ups-guard/pc.conf`): `UPS` (ups@server), `USER` (owner of uid 1000), `OFF_AT` (50), `FORCE_OFF` (yes),
-`COUNTDOWN` (60 s), `POWER_SAVE` (yes), `POLL` (10 s).
+`COUNTDOWN` (60 s), `POWER_SAVE` (yes), `POLL` (10 s), `USABLE_WH` (0).
+
+`USABLE_WH`: many small UPSes report no load over USB. Set it to the battery energy the UPS can actually
+deliver (roughly its rated watts times its rated runtime at that load) and ups-guard shows an estimated load
+worked out from the runtime the UPS reports. Calibrate it against the UPS's own display.
 
 It speaks upsd's text protocol itself, so a PC needs nothing installed but Python.
