@@ -15,12 +15,12 @@ FIREWALL_ZONE=${FIREWALL_ZONE:-$(firewall-cmd --get-default-zone 2>/dev/null || 
 dnf install -y nut nut-client
 
 # Ask the UPS which vendor/product it is so the driver binds to it and nothing else.
-read -r VID PID < <(lsusb | awk '/Phoenixtec|UPS|Smart-Battery|CyberPower|American Power|Eaton|Tripp/ {split($6,a,":"); print a[1], a[2]; exit}')
+read -r VID PID < <(lsusb | awk '/Phoenixtec|UPS|Smart-Battery|CyberPower|American Power|Eaton|Tripp/ && !f {f=1; split($6,a,":"); print a[1], a[2]}')
 [ -n "${VID:-}" ] || { echo "no USB UPS found in lsusb"; exit 1; }
 echo "UPS on USB: $VID:$PID"
 
 MONPASS=$(grep -oP '^\s*password\s*=\s*\K\S+' /etc/ups/upsd.users 2>/dev/null | head -1 || true)
-[ -n "$MONPASS" ] || MONPASS=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)
+[ -n "$MONPASS" ] || MONPASS=$(head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | cut -c1-24)  # no SIGPIPE under pipefail
 
 cat > /etc/ups/nut.conf <<EOF
 MODE=netserver
