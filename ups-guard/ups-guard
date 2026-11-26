@@ -1,0 +1,468 @@
+#!/usr/bin/env python3
+"""ups-guard: act on a UPS that NUT watches, on the server that owns it and on the PCs beside it.
+
+  ups-guard server        (user service on the NUT host) shed load when the battery falls to SHED_AT,
+                          give LOWPRIO containers the lowest CPU weight, put it all back when power returns
+  ups-guard pc            (root service on a PC) on battery: lowest power, a desktop notice, an alert file
+                          for Claude Code; at OFF_AT a countdown with a "Keep PC on" button, then power off
+  ups-guard status        what the UPS says now and what this machine would do
+  ups-guard keep-on       this boot, never power this PC off for the UPS
+  ups-guard allow-off     undo keep-on
+  ups-guard claude-hook   Claude Code hook: tell the session about a power alert, once per change
+
+Config: server ~/.config/ups-guard/server.conf, PC /etc/ups-guard/pc.conf (KEY=value lines).
+NUT's own upsmon still does the final clean shutdown of the NUT host; this only adds to it.
+"""
+import json
+import os
+import pwd
+import shlex
+import socket
+import subprocess
+import sys
+import time
+
+ALERT_DIR = os.environ.get("UPS_GUARD_ALERT_DIR", "/run/ups-guard")
+ALERT_FILE = os.path.join(ALERT_DIR, "alert")
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+# ---------------------------------------------------------------- config and NUT
+
+def load_conf(path, defaults):
+    conf = dict(defaults)
+    try:
+        with open(os.path.expanduser(path)) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    conf[k.strip()] = v.strip().strip('"')
+    except FileNotFoundError:
+        pass
+    return conf
+
+
+def nut_vars(spec):
+    """Every variable of one UPS, from upsd's plain text protocol. spec: name@host[:port]."""
+    name, _, hostport = spec.partition("@")
+    host, _, port = (hostport or "localhost").partition(":")
+    with socket.create_connection((host, int(port or 3493)), timeout=5) as s:
+        s.sendall(f"LIST VAR {name}\n".encode())
+        buf = b""
+        while b"END LIST VAR" not in buf:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+            if buf.startswith(b"ERR"):
+                raise RuntimeError(buf.decode().strip())
+        s.sendall(b"LOGOUT\n")
+    out = {}
+    for line in buf.decode().splitlines():
+        if line.startswith("VAR "):
+            parts = shlex.split(line)
+            if len(parts) >= 4:
+                out[parts[2]] = parts[3]
+    if not out:
+        raise RuntimeError("no variables from upsd")
+    return out
+
+
+def reading(v):
+    status = v.get("ups.status", "").split()
+    try:
+        charge = float(v.get("battery.charge", "nan"))
+    except ValueError:
+        charge = float("nan")
+    try:
+        runtime = int(float(v.get("battery.runtime", "-1")))
+    except ValueError:
+        runtime = -1
+    return status, charge, runtime
+
+
+def describe(charge, runtime):
+    s = f"{charge:.0f}%"
+    if runtime >= 0:
+        s += f", about {runtime // 60} min left"
+    return s
+
+
+def sh(*cmd, check=False, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, check=check, **kw)
+
+
+# ---------------------------------------------------------------- server mode
+
+SERVER_DEFAULTS = {
+    "UPS": "ups@localhost",
+    "SHED_AT": "90",          # stop SHED containers when on battery at or below this charge
+    "SHED": "",               # container names, space separated
+    "LOWPRIO": "",            # containers kept up but at the lowest CPU weight while shed
+    "RESTORE_AFTER": "60",    # seconds of steady mains before putting things back
+    "POLL": "10",
+    "STATE": "~/.local/state/ups-guard/shed.json",
+}
+
+
+def docker_running(name):
+    r = sh("docker", "inspect", "-f", "{{.State.Running}}", name)
+    return r.returncode == 0 and r.stdout.strip() == "true"
+
+
+def server():
+    c = load_conf(os.environ.get("UPS_GUARD_CONF", "~/.config/ups-guard/server.conf"), SERVER_DEFAULTS)
+    state_path = os.path.expanduser(c["STATE"])
+    os.makedirs(os.path.dirname(state_path), exist_ok=True)
+
+    def load():
+        try:
+            with open(state_path) as f:
+                return json.load(f)
+        except (FileNotFoundError, ValueError):
+            return {}
+
+    def save(st):
+        tmp = state_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(st, f, indent=2)
+        os.replace(tmp, state_path)
+
+    shed_at = float(c["SHED_AT"])
+    online_since = None
+    last_err = None
+    was_onbatt = False
+    log(f"watching {c['UPS']}: shed at {shed_at:.0f}% -> {c['SHED'] or '(nothing)'}; low priority: {c['LOWPRIO'] or '(none)'}")
+    while True:
+        try:
+            status, charge, runtime = reading(nut_vars(c["UPS"]))
+            last_err = None
+        except Exception as e:
+            if str(e) != last_err:
+                log(f"cannot read the UPS: {e}")
+                last_err = str(e)
+            time.sleep(int(c["POLL"]))
+            continue
+
+        st = load()
+        onbatt = "OB" in status
+        if onbatt != was_onbatt:
+            log(("on battery: " if onbatt else "on mains: ") + describe(charge, runtime) + f" [{' '.join(status)}]")
+            was_onbatt = onbatt
+
+        if onbatt:
+            online_since = None
+            if not st.get("shed") and charge == charge and charge <= shed_at:
+                stopped = [n for n in c["SHED"].split() if docker_running(n)]
+                log(f"battery {charge:.0f}% <= {shed_at:.0f}%: stopping {' '.join(stopped) or 'nothing'}")
+                if stopped:
+                    r = sh("docker", "stop", "-t", "60", *stopped)
+                    if r.returncode:
+                        log(f"docker stop: {r.stderr.strip()}")
+                shares = {}
+                for n in c["LOWPRIO"].split():
+                    r = sh("docker", "inspect", "-f", "{{.HostConfig.CpuShares}}", n)
+                    if r.returncode == 0:
+                        shares[n] = int(r.stdout.strip() or 0)
+                        sh("docker", "update", "--cpu-shares", "2", n)
+                        log(f"{n}: lowest CPU priority")
+                save({"shed": True, "stopped": stopped, "cpu_shares": shares,
+                      "at": time.strftime("%Y-%m-%d %H:%M:%S"), "charge": charge})
+        elif "OL" in status and st.get("shed"):
+            online_since = online_since or time.time()
+            if time.time() - online_since >= int(c["RESTORE_AFTER"]):
+                stopped = st.get("stopped", [])
+                log(f"power back for {c['RESTORE_AFTER']}s: starting {' '.join(stopped) or 'nothing'}")
+                if stopped:
+                    r = sh("docker", "start", *stopped)
+                    if r.returncode:
+                        log(f"docker start: {r.stderr.strip()}")
+                for n, v in st.get("cpu_shares", {}).items():
+                    sh("docker", "update", "--cpu-shares", str(v or 1024), n)
+                    log(f"{n}: CPU priority restored")
+                save({})
+                online_since = None
+        time.sleep(int(c["POLL"]))
+
+
+# ---------------------------------------------------------------- PC mode
+
+PC_DEFAULTS = {
+    "UPS": "ups@server",
+    "USER": "",               # desktop user to notify; default: the owner of /run/user/1000
+    "OFF_AT": "50",           # power this PC off when the UPS is on battery at or below this charge
+    "FORCE_OFF": "yes",       # "no": warn only, never power off
+    "COUNTDOWN": "60",        # seconds between the last warning and the power off
+    "POWER_SAVE": "yes",      # power-saver profile and the GPU's minimum power limit while on battery
+    "POLL": "10",
+}
+
+
+class Desktop:
+    def __init__(self, user):
+        if not user:
+            try:
+                user = pwd.getpwuid(1000).pw_name
+            except KeyError:
+                user = ""
+        self.user = user
+        self.uid = pwd.getpwnam(user).pw_uid if user else None
+
+    def _env(self):
+        return ["env", f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{self.uid}/bus",
+                f"XDG_RUNTIME_DIR=/run/user/{self.uid}"]
+
+    def cmd(self, *args):
+        if os.geteuid() == 0 and self.user:
+            return ["runuser", "-u", self.user, "--", *self._env(), *args]
+        return list(args)
+
+    def notify(self, title, body, urgency="critical"):
+        if self.uid is None or not os.path.exists(f"/run/user/{self.uid}/bus"):
+            return
+        sh(*self.cmd("notify-send", "-a", "UPS", "-i", "battery-caution", "-u", urgency, title, body), timeout=10)
+
+    def keep_flag(self):
+        return f"/run/user/{self.uid}/ups-guard-keep-on" if self.uid is not None else None
+
+
+def write_alert(level, text):
+    os.makedirs(ALERT_DIR, exist_ok=True)
+    os.chmod(ALERT_DIR, 0o755)
+    tmp = ALERT_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"level": level, "text": text, "at": time.strftime("%H:%M")}, f)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, ALERT_FILE)
+
+
+def clear_alert():
+    try:
+        os.remove(ALERT_FILE)
+    except FileNotFoundError:
+        pass
+
+
+class PowerSave:
+    """Lowest power while on battery, and back to what it was afterwards."""
+
+    def __init__(self):
+        self.saved = None
+
+    def on(self):
+        if self.saved is not None:
+            return
+        self.saved = {}
+        r = sh("powerprofilesctl", "get")
+        if r.returncode == 0:
+            self.saved["profile"] = r.stdout.strip()
+            sh("powerprofilesctl", "set", "power-saver")
+        r = sh("nvidia-smi", "--query-gpu=power.limit,power.min_limit", "--format=csv,noheader,nounits")
+        if r.returncode == 0 and r.stdout.strip():
+            cur, low = [x.strip() for x in r.stdout.splitlines()[0].split(",")]
+            self.saved["gpu"] = cur
+            sh("nvidia-smi", "-pl", low)
+        log(f"power saving on (was {self.saved})")
+
+    def off(self):
+        if self.saved is None:
+            return
+        if "profile" in self.saved:
+            sh("powerprofilesctl", "set", self.saved["profile"])
+        if "gpu" in self.saved:
+            sh("nvidia-smi", "-pl", self.saved["gpu"])
+        log(f"power saving off (back to {self.saved})")
+        self.saved = None
+
+
+def pc():
+    c = load_conf(os.environ.get("UPS_GUARD_CONF", "/etc/ups-guard/pc.conf"), PC_DEFAULTS)
+    d = Desktop(c["USER"])
+    ps = PowerSave()
+    off_at = float(c["OFF_AT"])
+    force = c["FORCE_OFF"].lower() in ("yes", "true", "1", "on")
+    onbatt = False
+    warned = set()
+    last_err = None
+    lost_since = None
+    log(f"watching {c['UPS']}: power off at {off_at:.0f}% ({'on' if force else 'warn only'}), notify {d.user}")
+    while True:
+        try:
+            status, charge, runtime = reading(nut_vars(c["UPS"]))
+            last_err = lost_since = None
+        except Exception as e:
+            if str(e) != last_err:
+                log(f"cannot read the UPS: {e}")
+                last_err = str(e)
+            if onbatt:
+                lost_since = lost_since or time.time()
+                if "lost" not in warned and time.time() - lost_since > 60:
+                    warned.add("lost")
+                    write_alert("lost", "The server stopped answering while on battery power: it has probably "
+                                        "shut down for low battery. Save everything now.")
+                    d.notify("Server gone while on battery", "It has probably shut down. Shut this PC down now.")
+            time.sleep(int(c["POLL"]))
+            continue
+
+        now_onbatt = "OB" in status
+        left = describe(charge, runtime)
+        if now_onbatt and not onbatt:
+            onbatt, warned = True, set()
+            log(f"on battery: {left}")
+            if c["POWER_SAVE"].lower() in ("yes", "true", "1", "on"):
+                ps.on()
+            plan = f"This PC powers off by itself at {off_at:.0f}%." if force else "This PC will not power off by itself."
+            write_alert("onbatt", f"Power is out at home. The server is on UPS battery ({left}). "
+                                  f"Save work and wrap up; the user should shut this PC down. {plan}")
+            d.notify("Power out: on UPS battery", f"{left}. Save your work and shut this PC down. {plan}")
+        elif not now_onbatt and onbatt and "OL" in status:
+            onbatt = False
+            log(f"power back: {left}")
+            ps.off()
+            clear_alert()
+            d.notify("Power is back", f"UPS on mains, {charge:.0f}%.", "normal")
+
+        if onbatt:
+            if charge <= 90 and "shed" not in warned:
+                warned.add("shed")
+                write_alert("shed", f"Still on UPS battery ({left}). The server is stopping its heavy services. "
+                                    f"Save work now; this PC should be shut down.")
+            if ("FSD" in status or "LB" in status) and "fsd" not in warned:
+                warned.add("fsd")
+                write_alert("fsd", f"UPS battery critical ({left}): the server is shutting down now.")
+                d.notify("Server shutting down", f"UPS battery critical ({left}).")
+            if force and charge <= off_at + 10 and "pre" not in warned and charge > off_at:
+                warned.add("pre")
+                d.notify("PC powers off soon", f"UPS at {left}. This PC powers off at {off_at:.0f}%. "
+                                              f"Run `ups-guard keep-on` to stop that.")
+            flag = d.keep_flag()
+            if force and charge <= off_at and "off" not in warned and not (flag and os.path.exists(flag)):
+                warned.add("off")
+                countdown(c, d, flag)
+        time.sleep(int(c["POLL"]))
+
+
+def countdown(c, d, flag):
+    secs = int(c["COUNTDOWN"])
+    write_alert("pcoff", f"UPS battery at the power-off threshold: this PC powers off in {secs} seconds "
+                         f"unless the user presses Keep PC on. Stop work and save now.")
+    log(f"power-off countdown: {secs}s")
+    p = None
+    if d.uid is not None and os.path.exists(f"/run/user/{d.uid}/bus"):
+        p = subprocess.Popen(d.cmd("notify-send", "-a", "UPS", "-i", "system-shutdown", "-u", "critical",
+                                   "-t", str(secs * 1000), "-A", "keep=Keep PC on", "-w",
+                                   f"Powering off in {secs} s", "UPS battery is low. Save your work now."),
+                             stdout=subprocess.PIPE, text=True)
+    end = time.time() + secs
+    while time.time() < end:
+        if p and p.poll() is not None and (p.stdout.read() or "").strip() == "keep":
+            open(flag, "w").close() if flag else None
+            break
+        if flag and os.path.exists(flag):
+            break
+        try:
+            status, _, _ = reading(nut_vars(c["UPS"]))
+            if "OB" not in status:
+                log("power came back during the countdown")
+                if p:
+                    p.terminate()
+                return
+        except Exception:
+            pass
+        time.sleep(2)
+    else:
+        log("powering off")
+        write_alert("pcoff", "This PC is powering off now for low UPS battery.")
+        sh("systemctl", "poweroff")
+        return
+    if p and p.poll() is None:
+        p.terminate()
+    log("kept on by the user")
+    write_alert("kept", "The user chose to keep this PC on while the UPS battery is low. Save work often.")
+    d.notify("Keeping this PC on", "It will not power off for the UPS this boot. `ups-guard allow-off` undoes it.", "normal")
+
+
+# ---------------------------------------------------------------- small commands
+
+def status_cmd():
+    spec = load_conf("/etc/ups-guard/pc.conf", PC_DEFAULTS)["UPS"]
+    if os.path.exists(os.path.expanduser("~/.config/ups-guard/server.conf")):
+        spec = load_conf("~/.config/ups-guard/server.conf", SERVER_DEFAULTS)["UPS"]
+    v = nut_vars(spec)
+    status, charge, runtime = reading(v)
+    print(f"{spec}: {' '.join(status)}  {describe(charge, runtime)}  load {v.get('ups.load', '?')}%")
+    flag = Desktop("").keep_flag()
+    if flag:
+        print("keep-on: " + ("set (this PC will not power off for the UPS)" if os.path.exists(flag) else "not set"))
+    if os.path.exists(ALERT_FILE):
+        print("alert: " + json.load(open(ALERT_FILE))["text"])
+
+
+def keep_on(on):
+    flag = Desktop("").keep_flag()
+    if on:
+        open(flag, "w").close()
+        print("This PC will not power off for the UPS until reboot (`ups-guard allow-off` to undo).")
+    else:
+        try:
+            os.remove(flag)
+        except FileNotFoundError:
+            pass
+        print("This PC may power off for the UPS again.")
+
+
+def claude_hook():
+    try:
+        inp = json.load(sys.stdin)
+    except ValueError:
+        inp = {}
+    event = inp.get("hook_event_name", "UserPromptSubmit")
+    sid = "".join(ch for ch in str(inp.get("session_id", "x")) if ch.isalnum() or ch in "-_") or "x"
+    mdir = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "ups-guard-hook")
+    os.makedirs(mdir, exist_ok=True)
+    marker = os.path.join(mdir, sid)
+    try:
+        alert = json.load(open(ALERT_FILE))
+    except (FileNotFoundError, ValueError):
+        alert = None
+    seen = open(marker).read() if os.path.exists(marker) else None
+    if alert is None:
+        if seen is None:
+            return
+        os.remove(marker)
+        msg = "UPS: power is back at home; the earlier power alert is over."
+    else:
+        if seen == alert["level"]:
+            return
+        open(marker, "w").write(alert["level"])
+        msg = f"UPS POWER ALERT ({alert['at']}): {alert['text']} Tell the user, keep work committed and saved, and avoid starting long jobs."
+    print(json.dumps({"systemMessage": msg,
+                      "hookSpecificOutput": {"hookEventName": event, "additionalContext": msg}}))
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if cmd == "server":
+        server()
+    elif cmd == "pc":
+        pc()
+    elif cmd == "status":
+        status_cmd()
+    elif cmd in ("keep-on", "allow-off"):
+        keep_on(cmd == "keep-on")
+    elif cmd == "claude-hook":
+        try:
+            claude_hook()
+        except Exception:
+            pass  # a hook must never get in the way of a session
+    else:
+        print(__doc__)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,14 @@
+[Unit]
+Description=ups-guard: warn, save power and power off this PC on UPS battery
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/ups-guard pc
+Restart=always
+RestartSec=10
+RuntimeDirectory=ups-guard
+RuntimeDirectoryMode=0755
+
+[Install]
+WantedBy=multi-user.target
