@@ -64,6 +64,9 @@ HOSTSYNC 15
 DEADTIME 15
 FINALDELAY 5
 POWERDOWNFLAG /etc/killpower
+# Some UPSes flash LB with a near-zero runtime for a few seconds at the switch to battery; only a low battery
+# that lasts 30 s counts, so that glitch cannot shut this machine down at full charge.
+OBLBDURATION 30
 EOF
 
 chown root:nut /etc/ups/upsd.users /etc/ups/upsmon.conf /etc/ups/ups.conf /etc/ups/upsd.conf
