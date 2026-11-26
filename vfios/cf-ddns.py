@@ -23,11 +23,14 @@ Usage:
 
 Token: ~/.config/cf-ddns/token (mode 600), needs Zone Read + DNS Edit on all zones.
 State: ~/.config/cf-ddns/state.json
+Hooks: ~/.config/cf-ddns/hooks.d/* (executables), run after the records move, with
+       CF_DDNS_OLD_IP and CF_DDNS_NEW_IP set (e.g. restart a service that advertises the address).
 """
 import argparse
 import ipaddress
 import json
 import os
+import subprocess
 import sys
 import time
 import urllib.error
@@ -37,6 +40,7 @@ from collections import Counter
 CONF = os.path.expanduser(os.environ.get("CF_DDNS_DIR", "~/.config/cf-ddns"))
 TOKEN_FILE = os.path.join(CONF, "token")
 STATE_FILE = os.path.join(CONF, "state.json")
+HOOKS_DIR = os.path.join(CONF, "hooks.d")
 API = "https://api.cloudflare.com/client/v4"
 IP_SOURCES = [
     "https://api.ipify.org",
@@ -194,6 +198,25 @@ def main():
     state.update(home_ip=new, changed_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"), previous=old)
     save_state(state)
     log(f"{moved} records moved to {new}")
+    run_hooks(old, new)
+
+
+def run_hooks(old, new):
+    """Run every executable in hooks.d (sorted) once the records have moved, with the old and new
+    address in CF_DDNS_OLD_IP and CF_DDNS_NEW_IP. A failing hook is logged and does not stop the rest."""
+    if not os.path.isdir(HOOKS_DIR):
+        return
+    env = dict(os.environ, CF_DDNS_OLD_IP=old or "", CF_DDNS_NEW_IP=new)
+    for name in sorted(os.listdir(HOOKS_DIR)):
+        path = os.path.join(HOOKS_DIR, name)
+        if name.startswith(".") or not os.path.isfile(path) or not os.access(path, os.X_OK):
+            continue
+        try:
+            r = subprocess.run([path], env=env, capture_output=True, text=True, timeout=300)
+            out = (r.stdout + r.stderr).strip().replace("\n", " | ")
+            log(f"hook {name}: exit {r.returncode}{': ' + out[:300] if out else ''}")
+        except Exception as e:
+            log(f"hook {name}: FAILED {e}")
 
 
 if __name__ == "__main__":

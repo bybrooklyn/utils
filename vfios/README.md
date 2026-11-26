@@ -51,7 +51,18 @@ Run `vfios` from any other computer and it SSHes to the server and runs there. S
 ~/.local/bin/vfios                    the command
 ~/.config/cf-ddns/token               your Cloudflare token (mode 600)
 ~/.config/cf-ddns/state.json          the last known home IP
+~/.config/cf-ddns/hooks.d/            optional scripts to run after the IP changes
 ~/.config/systemd/user/cf-ddns.*      the service and the 5-minute timer
+```
+
+## Hooks
+
+Some things need a kick when the home IP changes, such as a service that advertises its public address. Put an executable script in `~/.config/cf-ddns/hooks.d/`. After the DNS records move, vfios runs each one in name order, with `CF_DDNS_OLD_IP` and `CF_DDNS_NEW_IP` set. Each result goes in the log (`vfios log`). A hook that fails doesn't stop the others.
+
+```sh
+#!/bin/sh
+# ~/.config/cf-ddns/hooks.d/50-restart-app
+docker restart my-app
 ```
 
 To remove it: `vfios off`, delete those files, and revoke the token in Cloudflare.
