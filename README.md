@@ -8,6 +8,7 @@ General stuff I use every day on my PC and my home server. Each folder is its ow
 | [quest-wireless-adb](quest-wireless-adb/) | Turns wireless adb back on every time a Meta Quest reboots. |
 | [mc-gate](mc-gate/) | One front door for my Minecraft servers: routes by name, wakes sleeping servers when someone joins, stops empty ones. |
 | [dotfiles](dotfiles/) | My zsh setup and prompt, plus btop, fastfetch and micro configs. |
+| [cwpl](cwpl/) | Charlotte's Weak Copyleft Public License: the Mozilla Public License 2.0 plus a network clause. |
 
 ## How to use it
 
