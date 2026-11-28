@@ -19,7 +19,7 @@ toml_edit = "0.25.21"
 pulldown-cmark = { version = "0.13.6", default-features = false }
 
 [profile.release]
-opt-level = 3
+opt-level = "z"  # small over fast: it is quick enough either way
 lto = "fat"
 codegen-units = 1
 panic = "abort"

@@ -26,7 +26,7 @@ const DEFAULT_TOML: &str = r#"# lealand settings. ll wrote this the first time i
 # the launch and quit animations (ll --disable-flag and ll --enable-flag set this)
 animations = true
 # how much of the terminal the inline view may take, in percent
-max_height = 40
+max_height = 75
 # dotfiles: "dim" (after everything else, greyed), "show" (mixed in) or "hide"
 hidden = "dim"
 
@@ -115,7 +115,7 @@ pub fn load() -> (Config, Option<String>) {
         .unwrap_or_default();
     let config = Config {
         animations: look("animations").and_then(|v| v.as_bool()).unwrap_or(true),
-        max_height: look("max_height").and_then(|v| v.as_integer()).unwrap_or(40).clamp(10, 100) as u16,
+        max_height: look("max_height").and_then(|v| v.as_integer()).unwrap_or(75).clamp(10, 100) as u16,
         hidden,
         gap: Duration::from_millis(d.get("chords").and_then(|t| t.get("gap_ms")).and_then(|v| v.as_integer()).unwrap_or(1000).clamp(150, 5000) as u64),
         skip,
@@ -241,6 +241,6 @@ mod tests {
     fn default_toml_parses() {
         let list = format!("[{}]", super::SKIP.iter().map(|s| format!("{s:?}")).collect::<Vec<_>>().join(", "));
         let d: toml_edit::DocumentMut = super::DEFAULT_TOML.replace("SKIP_LIST", &list).parse().unwrap();
-        assert_eq!(d["look"]["max_height"].as_integer(), Some(40));
+        assert_eq!(d["look"]["max_height"].as_integer(), Some(75));
     }
 }
