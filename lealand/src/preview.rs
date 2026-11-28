@@ -27,6 +27,30 @@ pub fn text(path: &Path, n: usize, width: u16) -> Option<Vec<Line<'static>>> {
     Some(ansi(&String::from_utf8_lossy(&out.stdout)))
 }
 
+/// A code block coloured by bat for its language; None when bat doesn't know it.
+pub fn highlight(code: &str, lang: &str) -> Option<Vec<Line<'static>>> {
+    if lang.is_empty() {
+        return None;
+    }
+    let mut child = Command::new("bat")
+        .args(["--color=always", "--style=plain", "--paging=never"])
+        .arg(format!("--language={lang}"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdin = child.stdin.take()?;
+    let code = code.to_string();
+    let writer = std::thread::spawn(move || {
+        use std::io::Write;
+        let _ = stdin.write_all(code.as_bytes());
+    });
+    let out = child.wait_with_output().ok()?;
+    let _ = writer.join();
+    out.status.success().then(|| ansi(&String::from_utf8_lossy(&out.stdout)))
+}
+
 /// Terminal colour codes to styled lines. Only colours and bold/italic/underline matter here.
 pub fn ansi(text: &str) -> Vec<Line<'static>> {
     text.lines()

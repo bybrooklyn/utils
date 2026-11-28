@@ -6,6 +6,7 @@ mod config;
 mod icons;
 mod jump;
 mod logo;
+mod markdown;
 mod preview;
 mod sysinfo;
 
@@ -1068,7 +1069,7 @@ impl App {
         }
         self.draw_main(f);
         if let Some(t) = self.outro {
-            leaves(f, t.elapsed().as_millis());
+            fold(f, t.elapsed().as_millis());
         }
     }
 
@@ -1536,6 +1537,13 @@ impl App {
                     .collect(),
                 Err(e) => vec![Line::from(format!(" {}", e.kind()).fg(pal::RED))],
             }
+        } else if path.extension().is_some_and(|e| matches!(e.to_string_lossy().to_lowercase().as_str(), "md" | "markdown" | "mdx")) {
+            let text = fs::read(&path).map(|b| String::from_utf8_lossy(&b[..b.len().min(512 * 1024)]).into_owned()).unwrap_or_default();
+            markdown::render(&text, width.saturating_sub(1) as usize).into_iter().take(n).map(|l| {
+                let mut spans = vec![Span::raw(" ")];
+                spans.extend(l.spans);
+                Line::from(spans).style(l.style)
+            }).collect()
         } else if preview::is_image(&path) {
             match preview::png(&path) {
                 Some((png, w, h)) => {
@@ -1592,8 +1600,10 @@ const DISSOLVE_AT: u128 = 760;
 const INTRO_END: u128 = 1060;
 const ROW_STEP: u128 = 14;
 const LOG_LINES: usize = 5;
-/// Goodbye: the view falls apart into leaves for this long.
-const OUTRO_END: u128 = 420;
+/// Goodbye, the opening in reverse: rows fold away from the bottom up until FOLD_ROWS, then the
+/// rule shrinks to its middle and the header fades, until OUTRO_END.
+const FOLD_ROWS: u128 = 160;
+const OUTRO_END: u128 = 300;
 /// Rows around the list: a blank line, the header, the rule, then a blank line and the footer.
 const CHROME: u16 = 5;
 /// Columns around the name in a row: margin, marker, gap, icon, 2, then 4 before the size (9),
@@ -1611,39 +1621,49 @@ fn noise(x: usize, y: usize) -> f64 {
     (h >> 40) as f64 / (1u64 << 24) as f64
 }
 
-/// The goodbye: each character drops out at its own moment, and about a third of them turn into
-/// leaves that sway down and fade.
-fn leaves(f: &mut Frame, t: u128) {
+/// The goodbye: the rows fold up from the bottom, then the rule draws in to its middle and the
+/// header fades out. The view is a blank line, the header, the rule, the rows and the footer.
+fn fold(f: &mut Frame, t: u128) {
     let area = f.area();
     let buf = f.buffer_mut();
-    let old = buf.clone();
-    buf.reset();
-    let greens = [pal::DIR, pal::LEAF, Color::Rgb(0x6f, 0xb6, 0x5a), Color::Rgb(0x3f, 0x8a, 0x46)];
-    for y in area.top()..area.bottom() {
+    let (top, bottom) = (area.top(), area.bottom());
+    let below_rule = top + 3;
+    // rows and footer, cleared from the bottom up
+    let rows = bottom.saturating_sub(below_rule) as u128;
+    let gone = (rows * t.min(FOLD_ROWS) / FOLD_ROWS) as u16;
+    for y in bottom.saturating_sub(gone)..bottom {
         for x in area.left()..area.right() {
-            let cell = &old[(x, y)];
-            if cell.symbol() == " " && cell.bg == Color::Reset {
-                continue;
+            buf[(x, y)].reset();
+        }
+    }
+    if t <= FOLD_ROWS {
+        return;
+    }
+    let k = ((t - FOLD_ROWS) as f64 / (OUTRO_END - FOLD_ROWS) as f64).min(1.0);
+    // the rule keeps a shrinking piece in its middle
+    let rule_y = top + 2;
+    if rule_y < bottom {
+        // where the rule actually is: the view can be narrower than the terminal
+        let drawn: Vec<u16> = (area.left()..area.right()).filter(|&x| buf[(x, rule_y)].symbol() == "─").collect();
+        let (l, r) = (*drawn.first().unwrap_or(&area.left()), *drawn.last().unwrap_or(&area.left()));
+        let mid = (l + r) / 2;
+        let half = (((r - l) / 2) as f64 * (1.0 - k)) as u16;
+        for x in area.left()..area.right() {
+            if x < mid.saturating_sub(half) || x > mid + half {
+                buf[(x, rule_y)].reset();
             }
-            let n = noise(x as usize, y as usize + 7);
-            let start = (n * 170.0) as u128;
-            if t < start {
-                buf[(x, y)] = cell.clone();
-                continue;
+        }
+    }
+    // the header goes grey, then goes
+    let head_y = top + 1;
+    if head_y < bottom {
+        for x in area.left()..area.right() {
+            let cell = &mut buf[(x, head_y)];
+            if k > 0.75 {
+                cell.reset();
+            } else if k > 0.3 {
+                cell.set_fg(pal::FAINT).set_bg(Color::Reset);
             }
-            if cell.symbol() == " " || noise(x as usize + 3, y as usize) > 0.33 {
-                continue;
-            }
-            let age = t - start;
-            let fall = y as u128 + age / 45;
-            if fall >= area.bottom() as u128 {
-                continue;
-            }
-            let sway = ((age as f64 / 90.0 + n * 6.0).sin() * 1.3).round() as i32;
-            let nx = (x as i32 + sway).clamp(area.left() as i32, area.right() as i32 - 1) as u16;
-            let color = if age > 200 { pal::FAINT } else { greens[(n * 40.0) as usize % 4] };
-            let glyph = ["\u{f06c}", "\u{f06c}", "\u{f18c}", "‚"][(n * 97.0) as usize % 4];
-            buf[(nx, fall as u16)].set_symbol(glyph).set_style(Style::new().fg(color));
         }
     }
 }
