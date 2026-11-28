@@ -1,6 +1,6 @@
-//! What this machine is, for `ll fetch` and the ? screen. Read from /proc and /sys, plus lspci.
+//! What this machine is, for `ll fetch` and the ? screen. Read from /proc and /sys.
 
-use std::{collections::HashSet, env, ffi::CString, fs, process::Command};
+use std::{collections::HashSet, env, ffi::CString, fs};
 
 pub fn all() -> Vec<(&'static str, String)> {
     let mut v = vec![
@@ -55,28 +55,65 @@ fn cpu() -> String {
     format!("{name}, {threads} threads")
 }
 
+/// Display controllers on the PCI bus, named from the hwdata database (what lspci reads, without
+/// the 180 ms it takes to start).
 fn gpus() -> Vec<String> {
-    let out = Command::new("lspci").output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
-    out.lines()
-        .filter(|l| l.contains("VGA") || l.contains("3D controller") || l.contains("Display controller"))
-        .map(|l| {
-            let desc = l.splitn(3, ':').nth(2).unwrap_or(l).trim();
-            let vendor = if desc.contains("NVIDIA") {
+    let ids = fs::read_to_string("/usr/share/hwdata/pci.ids").unwrap_or_default();
+    let read = |p: &std::path::Path, f: &str| fs::read_to_string(p.join(f)).unwrap_or_default().trim().trim_start_matches("0x").to_string();
+    let mut found: Vec<(String, String)> = fs::read_dir("/sys/bus/pci/devices")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| read(p, "class").starts_with("03"))
+        .map(|p| (read(&p, "vendor"), read(&p, "device")))
+        .collect();
+    found.sort();
+    found
+        .into_iter()
+        .map(|(v, d)| {
+            let (vendor, model) = pci_name(&ids, &v, &d);
+            let vendor = if vendor.contains("NVIDIA") {
                 "NVIDIA"
-            } else if desc.contains("AMD") || desc.contains("ATI") {
+            } else if vendor.contains("AMD") || vendor.contains("ATI") {
                 "AMD"
-            } else if desc.contains("Intel") {
+            } else if vendor.contains("Intel") {
                 "Intel"
             } else {
-                ""
+                vendor.as_str()
             };
             // "GA104 [GeForce RTX 3070 Ti]" -> the part in brackets
-            let model = desc.rsplit_once('[').and_then(|(_, r)| r.split(']').next()).unwrap_or(desc);
-            let model = model.split('/').next().unwrap_or(model).trim();
-            let built_in = desc.contains("Radeon") && (model.ends_with('M') || desc.contains("Granite") || desc.contains("Raphael"));
-            format!("{vendor} {model}{}", if built_in { " (built in)" } else { "" }).trim().to_string()
+            let short = model.rsplit_once('[').and_then(|(_, r)| r.split(']').next()).unwrap_or(&model);
+            let short = short.split('/').next().unwrap_or(short).trim();
+            let built_in = vendor == "AMD" && (short.ends_with('M') || model.contains("Granite") || model.contains("Raphael"));
+            format!("{vendor} {short}{}", if built_in { " (built in)" } else { "" }).trim().to_string()
         })
-        .collect()
+        .collect::<Vec<_>>()
+        .tap_sort()
+}
+
+trait TapSort {
+    fn tap_sort(self) -> Self;
+}
+
+impl TapSort for Vec<String> {
+    /// The card you plugged in first, the one built into the CPU after.
+    fn tap_sort(mut self) -> Self {
+        self.sort_by_key(|g| g.contains("built in"));
+        self
+    }
+}
+
+fn pci_name(ids: &str, vendor: &str, device: &str) -> (String, String) {
+    let mut lines = ids.lines().skip_while(|l| !l.starts_with(vendor));
+    let vname = lines.next().map(|l| l[vendor.len()..].trim().to_string()).unwrap_or_default();
+    let tab = format!("\t{device}");
+    let dname = lines
+        .take_while(|l| l.starts_with('\t') || l.starts_with('#') || l.is_empty())
+        .find(|l| l.starts_with(&tab))
+        .map(|l| l[tab.len()..].trim().to_string())
+        .unwrap_or_else(|| format!("device {device}"));
+    (vname, dname)
 }
 
 fn memory() -> String {
