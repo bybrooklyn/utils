@@ -134,6 +134,7 @@ struct App {
     users: HashMap<u32, String>,
     tty_cmd: Option<Command>,
     tty_wait: bool,
+    sys: Option<Vec<(&'static str, String)>>,
     intro: Option<Instant>,
     cascade: Option<Instant>,
     outro: Option<Instant>,
@@ -383,6 +384,7 @@ impl App {
             users: HashMap::new(),
             tty_cmd: None,
             tty_wait: false,
+            sys: None,
             intro: None,
             cascade: None,
             outro: None,
@@ -416,7 +418,7 @@ impl App {
         }
         let want = match &self.mode {
             Mode::Browse | Mode::Name { .. } | Mode::Confirm(_) => self.entries.len().max(1),
-            Mode::Help => self.chords.len() + 10,
+            Mode::Help => 999, // as tall as the terminal
             Mode::Jump { .. } => self.entries.len().max(8),
             Mode::Pick { .. } => 12,
         };
@@ -1018,25 +1020,10 @@ impl App {
                 left = Line::from(vec![
                     "   \u{f06c} ".fg(pal::DIR),
                     Span::styled("lealand", Style::new().fg(pal::DIR).add_modifier(Modifier::ITALIC)),
-                    "   chords and keys".fg(pal::TEXT).bold(),
+                    "   chords, keys and this machine".fg(pal::TEXT).bold(),
                 ]);
                 right = Line::from("any key closes ".fg(pal::DIM));
-                lines.push(Line::from(Span::styled("  chords, typed quickly", Style::new().fg(pal::DIR).add_modifier(Modifier::ITALIC))));
-                for c in &self.chords {
-                    lines.push(Line::from(vec![format!("    {:<11}", c.keys).fg(pal::AMBER).bold(), describe(&c.act).fg(pal::TEXT)]));
-                }
-                lines.push(Line::default());
-                lines.push(Line::from(Span::styled("  keys", Style::new().fg(pal::DIR).add_modifier(Modifier::ITALIC))));
-                for (k, d) in [
-                    ("← →", "parent / open"),
-                    ("↑ ↓", "move, with ctrl 5 at a time"),
-                    ("pgup pgdn", "page, home/end for first/last"),
-                    ("backspace", "back to the last folder"),
-                    ("/", "jump to any folder: type a bit, tab to go"),
-                    ("esc esc", "quit, shell stays where it was"),
-                ] {
-                    lines.push(Line::from(vec![format!("    {k:<11}").fg(pal::LINK).bold(), d.fg(pal::TEXT)]));
-                }
+                lines = self.help_lines(body.width as usize, rows);
             }
             Mode::Jump { q, sel, hits, .. } => {
                 let top = hits.get(*sel);
@@ -1188,6 +1175,74 @@ impl App {
             }
         }
         f.render_widget(Paragraph::new(lines), f.area());
+    }
+
+    /// The ? screen: the wordmark if there's room, then this machine beside the chords and keys.
+    fn help_lines(&mut self, width: usize, rows: usize) -> Vec<Line<'static>> {
+        let heading = |t: &str| Line::from(Span::styled(format!("  {t}"), Style::new().fg(pal::DIR).add_modifier(Modifier::ITALIC)));
+        let sys = self.sys.get_or_insert_with(sysinfo::all).clone();
+        let label_w = sys.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+        let mut machine = vec![heading("this machine")];
+        let mut last = "";
+        for (k, v) in &sys {
+            let label = if *k == last { "" } else { k };
+            last = k;
+            machine.push(Line::from(vec![format!("    {label:>label_w$}  ").fg(pal::DIM), v.clone().fg(pal::TEXT)]));
+        }
+        let mut keys = vec![heading("chords, typed quickly")];
+        for c in &self.chords {
+            keys.push(Line::from(vec![format!("    {:<10}", c.keys).fg(pal::AMBER).bold(), describe(&c.act).fg(pal::TEXT)]));
+        }
+        keys.push(Line::default());
+        keys.push(heading("keys"));
+        for (k, d) in [
+            ("← →", "up a folder (not past ~) / open, run"),
+            ("↑ ↓", "move, with ctrl 5 at a time"),
+            ("pgup pgdn", "a page, home and end for first and last"),
+            ("backspace", "back to the last folder"),
+            ("/", "jump to any folder: type a bit, tab to go"),
+            ("mouse", "click picks, click again opens, wheel moves"),
+            ("esc esc", "quit, shell stays where it was"),
+        ] {
+            keys.push(Line::from(vec![format!("    {k:<10}").fg(pal::LINK).bold(), d.fg(pal::TEXT)]));
+        }
+        let col = machine.iter().map(|l| l.width()).max().unwrap_or(0) + 4;
+        let side_by_side = width >= col + keys.iter().map(|l| l.width()).max().unwrap_or(0);
+        let mut body: Vec<Line<'static>> = Vec::new();
+        if side_by_side {
+            for i in 0..machine.len().max(keys.len()) {
+                let mut spans = machine.get(i).cloned().unwrap_or_default().spans;
+                let w: usize = spans.iter().map(|s| s.width()).sum();
+                spans.push(Span::raw(" ".repeat(col.saturating_sub(w))));
+                spans.extend(keys.get(i).cloned().unwrap_or_default().spans);
+                body.push(Line::from(spans));
+            }
+        } else {
+            body = machine;
+            body.push(Line::default());
+            body.extend(keys);
+        }
+        let logo_w = logo::LOGO.iter().map(|r| r.len()).max().unwrap_or(0) + 2;
+        if rows >= body.len() + logo::LOGO.len() + 1 && width >= logo_w {
+            let mut out: Vec<Line<'static>> = logo::LOGO
+                .iter()
+                .map(|row| {
+                    let mut spans = vec![Span::raw("  ")];
+                    for &(c, fg, bg) in row.iter() {
+                        let mut st = Style::new().fg(rgb(fg));
+                        if let Some(b) = bg {
+                            st = st.bg(rgb(b));
+                        }
+                        spans.push(Span::styled(c.to_string(), st));
+                    }
+                    Line::from(spans)
+                })
+                .collect();
+            out.push(Line::default());
+            out.extend(body);
+            return out;
+        }
+        body
     }
 
     /// While a chord is half typed: the keys that can come next and what they do.
@@ -1502,7 +1557,7 @@ fn describe(a: &Action) -> String {
         Action::Quit => "quit and cd here".into(),
         Action::Help => "this list".into(),
         Action::Full => "fullscreen with a preview, on and off".into(),
-        Action::OpenWith => "pick the app for this kind of file again (del there forgets it)".into(),
+        Action::OpenWith => "pick the app for this kind of file again".into(),
         Action::Mkdir(None) => "make a folder here".into(),
         Action::Mkdir(Some(c)) => format!("make a folder, cd into it and run {}", friendly(c)),
         Action::Trash => "move to the trash (asks first)".into(),

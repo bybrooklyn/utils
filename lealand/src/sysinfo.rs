@@ -69,7 +69,7 @@ fn gpus() -> Vec<String> {
         .map(|p| (read(&p, "vendor"), read(&p, "device")))
         .collect();
     found.sort();
-    found
+    let mut names = found
         .into_iter()
         .map(|(v, d)| {
             let (vendor, model) = pci_name(&ids, &v, &d);
@@ -88,20 +88,10 @@ fn gpus() -> Vec<String> {
             let built_in = vendor == "AMD" && (short.ends_with('M') || model.contains("Granite") || model.contains("Raphael"));
             format!("{vendor} {short}{}", if built_in { " (built in)" } else { "" }).trim().to_string()
         })
-        .collect::<Vec<_>>()
-        .tap_sort()
-}
-
-trait TapSort {
-    fn tap_sort(self) -> Self;
-}
-
-impl TapSort for Vec<String> {
-    /// The card you plugged in first, the one built into the CPU after.
-    fn tap_sort(mut self) -> Self {
-        self.sort_by_key(|g| g.contains("built in"));
-        self
-    }
+        .collect::<Vec<_>>();
+    // the card you plugged in first, the one built into the CPU after
+    names.sort_by_key(|g| g.contains("built in"));
+    names
 }
 
 fn pci_name(ids: &str, vendor: &str, device: &str) -> (String, String) {
