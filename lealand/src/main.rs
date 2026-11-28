@@ -296,7 +296,7 @@ impl App {
 
     fn max_height(&self) -> u16 {
         let rows = terminal::size().map_or(24, |s| s.1);
-        (rows * 2 / 5).max(6).min(rows)
+        (rows * 2 / 5).max(10).min(rows)
     }
 
     fn height(&self) -> u16 {
@@ -310,7 +310,7 @@ impl App {
             Mode::Pick { .. } => 12,
         };
         let cap = if matches!(self.mode, Mode::Help) { terminal::size().map_or(24, |s| s.1) } else { self.max_height() };
-        (want as u16 + 1).min(cap)
+        (want as u16 + CHROME).min(cap)
     }
 
     fn busy(&self) -> bool {
@@ -739,14 +739,16 @@ impl App {
         } else {
             // inline, the view is only as wide as its rows
             let want = match self.mode {
-                Mode::Browse => self.row_width().max(56),
+                Mode::Browse => (self.row_width() + 2).max(58),
                 Mode::Name { .. } | Mode::Confirm(_) => self.row_width().max(72),
                 _ => area.width as usize,
             };
             (Rect { width: (want as u16).min(area.width), ..area }, None)
         };
-        let head = Rect { height: 1, ..main };
-        let body = Rect { y: main.y + 1, height: main.height.saturating_sub(1), ..main };
+        let head = Rect { y: main.y + 1, height: 1, ..main };
+        let rule = Rect { x: main.x + 2, y: main.y + 2, width: main.width.saturating_sub(4), height: 1 };
+        let body = Rect { y: main.y + 3, height: main.height.saturating_sub(CHROME), width: main.width.saturating_sub(2), ..main };
+        let foot = Rect { y: main.y + main.height.saturating_sub(1), height: 1, ..main };
         let mut lines: Vec<Line> = Vec::new();
         let right: Line;
         let left: Line;
@@ -765,7 +767,7 @@ impl App {
                     lines.push(Line::from("   empty".fg(pal::DIM)));
                 }
                 let (names, flags) = self.widths();
-                let name_w = names.min((body.width as usize).saturating_sub(26 + flags)).max(8);
+                let name_w = names.min((body.width as usize).saturating_sub(ROW_FIXED + flags)).max(8);
                 let shown = self.cascade.map_or(rows, |t| (t.elapsed().as_millis() / ROW_STEP) as usize + 1);
                 for i in self.scroll..(self.scroll + rows.min(shown)).min(self.entries.len()) {
                     lines.push(self.row(i, name_w));
@@ -773,7 +775,7 @@ impl App {
             }
             Mode::Help => {
                 left = Line::from(vec![
-                    " \u{f06c} ".fg(pal::DIR),
+                    "   \u{f06c} ".fg(pal::DIR),
                     Span::styled("lealand", Style::new().fg(pal::DIR).add_modifier(Modifier::ITALIC)),
                     "   chords and keys".fg(pal::TEXT).bold(),
                 ]);
@@ -803,7 +805,7 @@ impl App {
                     _ if ghost.is_empty() => String::new(),
                     _ => format!("  → {ghost}"),
                 };
-                left = Line::from(vec![" /".fg(pal::AMBER).bold(), q.clone().bold(), rest.fg(pal::DIM)]);
+                left = Line::from(vec!["   /".fg(pal::AMBER).bold(), q.clone().bold(), rest.fg(pal::DIM)]);
                 right = Line::from(top.map(|p| tilde(p)).unwrap_or_default().fg(pal::DIM));
                 if hits.is_empty() {
                     let ready = self.index.ready.load(std::sync::atomic::Ordering::Relaxed);
@@ -813,8 +815,8 @@ impl App {
                 for (i, p) in hits.iter().enumerate().take(rows) {
                     let name = p.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
                     let parent = p.parent().map(tilde).unwrap_or_default();
-                    let mark = if i == *sel { "▎" } else { " " };
-                    let mut l = Line::from(vec![mark.fg(pal::DIR), " \u{f07b} ".fg(pal::DIR), name.fg(pal::DIR).bold(), format!("  {parent}").fg(pal::DIM)]);
+                    let mark = if i == *sel { " ▎ " } else { "   " };
+                    let mut l = Line::from(vec![mark.fg(pal::DIR), "\u{f07b}  ".fg(pal::DIR), name.fg(pal::DIR).bold(), format!("    {parent}").fg(pal::DIM)]);
                     if i == *sel {
                         l = l.style(Style::new().bg(pal::SEL));
                     }
@@ -823,7 +825,7 @@ impl App {
             }
             Mode::Pick { file, mime, apps, handles, filter, sel, current } => {
                 let name = file.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
-                left = Line::from(vec![" open ".into(), name.bold(), " with".into()]);
+                left = Line::from(vec!["   open ".fg(pal::TEXT), name.bold(), " with".into()]);
                 let forget = if current.is_some() { "  del forgets" } else { "" };
                 right = Line::from(vec![filter.clone().fg(pal::AMBER), format!("  {mime}{forget} ").fg(pal::DIM)]);
                 let shown = picked(apps, filter);
@@ -845,7 +847,7 @@ impl App {
                     if current.as_ref() == Some(&a.path) {
                         spans.push("  current".fg(pal::AMBER));
                     }
-                    spans[0] = if row == *sel { "▎ ".fg(pal::DIR) } else { "  ".into() };
+                    spans[0] = if row == *sel { " ▎ ".fg(pal::DIR) } else { "   ".into() };
                     let mut l = Line::from(spans);
                     if row == *sel {
                         l = l.style(Style::new().bg(pal::SEL));
@@ -857,11 +859,14 @@ impl App {
                 }
             }
         }
-        let rw = right.width() as u16;
+        let rw = right.width() as u16 + 1;
         f.render_widget(Paragraph::new(left), Rect { width: head.width.saturating_sub(rw + 1), ..head });
         f.render_widget(Paragraph::new(right), Rect { x: head.x + head.width.saturating_sub(rw), width: rw.min(head.width), ..head });
         f.render_widget(Paragraph::new(lines), body);
+        f.render_widget(Paragraph::new("─".repeat(rule.width as usize).fg(pal::FAINT)), rule);
+        f.render_widget(Paragraph::new(self.footer()), foot);
         if let Some(side) = side {
+            let side = Rect { y: side.y + 1, height: side.height.saturating_sub(1), ..side };
             let lines = self.preview_lines(side.height.saturating_sub(2) as usize);
             let title = self.selected().map(|e| {
                 let what = if e.dir { format!("{}/", e.name) } else { e.name.clone() };
@@ -882,11 +887,11 @@ impl App {
         match &self.mode {
             Mode::Name { text, then } => {
                 let after = then.as_ref().map_or("enter makes it".into(), |c| format!("enter makes it and runs {c}"));
-                (Line::from(vec![" new folder: ".fg(pal::AMBER), text.clone().bold(), "▏".into()]), Line::from(format!("{after}, esc cancels ").fg(pal::DIM)))
+                (Line::from(vec!["   new folder: ".fg(pal::AMBER), text.clone().bold(), "▏".into()]), Line::from(format!("{after}, esc cancels ").fg(pal::DIM)))
             }
             Mode::Confirm(p) => {
                 let name = p.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
-                (Line::from(vec![" trash ".fg(pal::RED), name.bold(), "?".into()]), Line::from("y moves it to the trash, any other key keeps it ".fg(pal::DIM)))
+                (Line::from(vec!["   trash ".fg(pal::RED), name.bold(), "?".into()]), Line::from("y moves it to the trash, any other key keeps it ".fg(pal::DIM)))
             }
             _ => (self.crumbs(), self.status()),
         }
@@ -935,10 +940,36 @@ impl App {
         f.render_widget(Paragraph::new(lines), f.area());
     }
 
+    /// The quiet line at the bottom: what's here, or the keys for the screen you're on.
+    fn footer(&self) -> Line<'static> {
+        let say = match &self.mode {
+            Mode::Jump { .. } => "tab or enter goes  ·  ↑ ↓ picks  ·  esc cancels".to_string(),
+            Mode::Pick { .. } => "enter opens  ·  type to filter  ·  del forgets  ·  esc cancels".to_string(),
+            Mode::Help => "add your own in ~/.config/lealand/chords".to_string(),
+            _ => {
+                let folders = self.entries.iter().filter(|e| e.dir).count();
+                let hidden = self.entries.iter().filter(|e| e.hidden).count();
+                let n = self.entries.len();
+                let mut v = vec![format!("{n} item{}", if n == 1 { "" } else { "s" })];
+                if folders > 0 {
+                    v.push(format!("{folders} folder{}", if folders == 1 { "" } else { "s" }));
+                }
+                if hidden > 0 {
+                    v.push(format!("{hidden} hidden"));
+                }
+                if n > self.rows {
+                    v.push(format!("{} of {n}", self.sel + 1));
+                }
+                v.join("  ·  ")
+            }
+        };
+        Line::from(format!("    {say}").fg(pal::FAINT))
+    }
+
     /// lealand, then the path as ~ › utils › lealand with the folder you're in brightest.
     fn crumbs(&self) -> Line<'static> {
         let mut spans = vec![
-            Span::styled(" \u{f06c} ", Style::new().fg(pal::DIR)),
+            Span::styled("   \u{f06c} ", Style::new().fg(pal::DIR)),
             Span::styled("lealand", Style::new().fg(pal::DIR).add_modifier(Modifier::ITALIC)),
             Span::raw("   "),
         ];
@@ -968,8 +999,7 @@ impl App {
         if let Some((m, _)) = &self.msg {
             return Line::from(format!("{m} ").fg(pal::RED));
         }
-        let pos = if self.entries.len() > self.rows { format!("{}/{}  ", self.sel + 1, self.entries.len()) } else { String::new() };
-        Line::from(format!("{pos}? help ").fg(pal::DIM))
+        Line::from("? help ".fg(pal::DIM))
     }
 
     /// Widest name (with its link target) and widest flags in this folder, so columns sit right
@@ -993,7 +1023,7 @@ impl App {
     /// Columns besides the name: icon 3, size 9, date 11, git 2, flags after a space.
     fn row_width(&mut self) -> usize {
         let (n, f) = self.widths();
-        n + 26 + f
+        n + ROW_FIXED + f
     }
 
     fn row(&mut self, i: usize, name_w: usize) -> Line<'static> {
@@ -1032,13 +1062,14 @@ impl App {
         };
         let selected = i == self.sel;
         let mut l = Line::from(vec![
-            Span::styled(if selected { "▎" } else { " " }, Style::new().fg(pal::DIR)),
-            Span::styled(format!("{} ", icons::icon(&e.name, e.dir, e.link.is_some(), e.mode & 0o111 != 0, selected)), base.remove_modifier(Modifier::BOLD)),
+            Span::raw(" "),
+            Span::styled(if selected { "▎ " } else { "  " }, Style::new().fg(pal::DIR)),
+            Span::styled(format!("{}  ", icons::icon(&e.name, e.dir, e.link.is_some(), e.mode & 0o111 != 0, selected)), base.remove_modifier(Modifier::BOLD)),
             Span::styled(fit(&name, name_w), base),
-            Span::styled(format!("{size:>9}"), dim),
-            Span::styled(format!("  {:<9}", ago(e.mtime)), dim),
-            Span::styled(format!(" {gc}"), gs),
-            Span::styled(format!(" {flags}"), Style::new().fg(pal::AMBER)),
+            Span::styled(format!("    {size:>9}"), dim),
+            Span::styled(format!("    {:<9}", ago(e.mtime)), dim),
+            Span::styled(format!("   {gc}"), gs),
+            Span::styled(format!("  {flags}"), Style::new().fg(pal::AMBER)),
         ]);
         if selected {
             l = l.style(Style::new().bg(pal::SEL));
@@ -1113,6 +1144,11 @@ const DISSOLVE_AT: u128 = 760;
 const INTRO_END: u128 = 1060;
 const ROW_STEP: u128 = 14;
 const LOG_LINES: usize = 5;
+/// Rows around the list: a blank line, the header, the rule, then a blank line and the footer.
+const CHROME: u16 = 5;
+/// Columns around the name in a row: margin, marker, gap, icon, 2, then 4 before the size (9),
+/// 4 before the date (9), 3 before git (1) and 2 before the flags.
+const ROW_FIXED: usize = 38;
 
 fn splash_off_file() -> PathBuf {
     env::var_os("XDG_CONFIG_HOME").map_or_else(|| jump::home().join(".config"), PathBuf::from).join("lealand/no-flag")
