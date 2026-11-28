@@ -12,10 +12,6 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-/// Skipped by the index on top of what tokei skips (hidden folders, anything .gitignored).
-/// Paths with a slash are from ~; the rest match anywhere.
-const SKIP: [&str; 11] =
-    ["node_modules", "target", "__pycache__", "venv", ".venv", "dist", "steamapps", "drive_c", "go/pkg", "Android/Sdk", "Steam"];
 const STALE: Duration = Duration::from_secs(3600);
 
 #[derive(Default)]
@@ -47,7 +43,8 @@ pub fn record(dir: &Path) {
 }
 
 /// Loads everything on a background thread so the listing never waits for it.
-pub fn start() -> Arc<Index> {
+/// `skip` is jump.skip from lealand.toml: folders the index leaves out.
+pub fn start(skip: Vec<String>) -> Arc<Index> {
     let ix = Arc::new(Index::default());
     let i = ix.clone();
     thread::spawn(move || {
@@ -59,7 +56,7 @@ pub fn start() -> Arc<Index> {
         }
         let age = fs::metadata(&file).and_then(|m| m.modified()).map(|t| t.elapsed().unwrap_or_default());
         if age.map_or(true, |a| a > STALE) {
-            let dirs = walk();
+            let dirs = walk(&skip);
             let _ = fs::create_dir_all(file.parent().unwrap());
             let tmp = file.with_extension("tmp");
             let text: String = dirs.iter().map(|d| format!("{}\n", d.display())).collect();
@@ -78,10 +75,10 @@ fn named(p: PathBuf) -> (PathBuf, String) {
     (p, name)
 }
 
-fn walk() -> Vec<PathBuf> {
+fn walk(skip: &[String]) -> Vec<PathBuf> {
     let home = home();
     let mut ov = OverrideBuilder::new(&home);
-    for g in SKIP {
+    for g in skip {
         ov.add(&format!("!{g}")).unwrap();
     }
     let config = home.join(".config");
@@ -274,7 +271,7 @@ mod tests {
     #[test]
     #[ignore]
     fn speed() {
-        let ix = super::start();
+        let ix = super::start(crate::config::SKIP.map(String::from).to_vec());
         while !ix.ready.load(std::sync::atomic::Ordering::Relaxed) {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }

@@ -2,6 +2,7 @@
 //! It prints where you ended up (and maybe a command) on stdout; the zsh `ll` function cds and runs it.
 
 mod apps;
+mod config;
 mod icons;
 mod jump;
 mod logo;
@@ -41,27 +42,8 @@ use std::{
 };
 use unicode_width::UnicodeWidthChar;
 
-/// Keys of a chord must come within this long of each other. The footer shows what can follow
-/// while you think, and enter or space runs a chord that is waiting for a longer one.
-const GAP: Duration = Duration::from_millis(1000);
 /// Esc twice within this long quits.
 const ESC_GAP: Duration = Duration::from_millis(400);
-
-/// `keys action [command]`. ~/.config/lealand/chords uses the same format and wins; `xx none` removes one.
-/// A chord that starts a longer one (mk, mkcl) fires when no next key comes within GAP.
-const DEFAULT_CHORDS: &str = r#"
-qq    quit
-?     help
-fu    full
-op    open-with
-cl    exit  claude
-fi    spawn dolphin .
-code  spawn code .
-mk    mkdir
-mkcl  mkdir-exit claude
-rm    trash
-tt    spawn ghostty +new-tab --working-directory="$PWD"
-"#;
 
 type Term = Terminal<CrosstermBackend<io::Stdout>>;
 
@@ -134,6 +116,7 @@ struct App {
     users: HashMap<u32, String>,
     tty_cmd: Option<Command>,
     tty_wait: bool,
+    cfg: config::Config,
     sys: Option<Vec<(&'static str, String)>>,
     intro: Option<Instant>,
     cascade: Option<Instant>,
@@ -152,17 +135,17 @@ fn main() {
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         [] => {}
         ["--disable-flag"] => {
-            let f = splash_off_file();
-            let _ = fs::create_dir_all(f.parent().unwrap());
-            let _ = fs::write(&f, "");
-            eprintln!("lealand: no launch animation from now on (ll --enable-flag brings it back)");
+            let _ = config::load();
+            config::set_animations(false);
+            eprintln!("lealand: no launch or quit animations from now on (ll --enable-flag brings them back)");
             return;
         }
         ["--flag"] => return show_flag(),
         ["fetch"] => return fetch(),
         ["--enable-flag"] => {
-            let _ = fs::remove_file(splash_off_file());
-            eprintln!("lealand: the launch animation is back");
+            let _ = config::load();
+            config::set_animations(true);
+            eprintln!("lealand: the animations are back");
             return;
         }
         _ => {
@@ -351,10 +334,12 @@ fn run(app: &mut App) -> io::Result<()> {
 
 impl App {
     fn new(dir: PathBuf) -> Self {
+        let (cfg, cfg_err) = config::load();
         let (chords, err) = load_chords();
+        let err = cfg_err.or(err);
         let (sizes_tx, sizes_rx) = mpsc::channel();
         let mut app = App {
-            entries: read_entries(&dir).unwrap_or_default(),
+            entries: Vec::new(),
             dir: dir.clone(),
             sel: 0,
             scroll: 0,
@@ -379,11 +364,12 @@ impl App {
             sizes_rx,
             sizes_tx,
             msg: err.map(|e| (e, Instant::now())),
-            index: jump::start(),
+            index: jump::start(cfg.skip.clone()),
             uid: unsafe { libc::getuid() },
             users: HashMap::new(),
             tty_cmd: None,
             tty_wait: false,
+            cfg,
             sys: None,
             intro: None,
             cascade: None,
@@ -391,10 +377,12 @@ impl App {
             outro_skipped: false,
             body_top: 0,
             click_at: None,
-            animate: !splash_off_file().exists(),
+            animate: true,
             done: false,
             answer: None,
         };
+        app.animate = app.cfg.animations;
+        app.entries = app.listing(&dir).unwrap_or_default();
         app.git_rx = Some(git_status(dir));
         let (cols, rows) = terminal::size().unwrap_or((0, 0));
         if app.animate && cols as usize >= logo::LOGO.iter().map(|r| r.len()).max().unwrap_or(0) + 2 && rows >= app.intro_height() + 2 {
@@ -409,7 +397,7 @@ impl App {
 
     fn max_height(&self) -> u16 {
         let rows = terminal::size().map_or(24, |s| s.1);
-        (rows * 2 / 5).max(10).min(rows)
+        (rows * self.cfg.max_height / 100).max(10).min(rows)
     }
 
     fn height(&self) -> u16 {
@@ -531,8 +519,19 @@ impl App {
         self.entries.get(self.sel)
     }
 
+    /// A folder's entries, with dotfiles dimmed, mixed in or left out as lealand.toml says.
+    fn listing(&self, dir: &Path) -> io::Result<Vec<Entry>> {
+        let mut v = read_entries(dir)?;
+        match self.cfg.hidden {
+            config::Hidden::Dim => {}
+            config::Hidden::Hide => v.retain(|e| !e.hidden),
+            config::Hidden::Show => v.sort_by(|a, b| (!a.dir).cmp(&!b.dir).then_with(|| natural(a.name.trim_start_matches('.'), b.name.trim_start_matches('.')))),
+        }
+        Ok(v)
+    }
+
     fn go(&mut self, dir: PathBuf, select: Option<String>, remember: bool) {
-        let entries = match read_entries(&dir) {
+        let entries = match self.listing(&dir) {
             Ok(e) => e,
             Err(e) => return self.flash(format!("can't open {}: {}", tilde(&dir), e.kind())),
         };
@@ -644,7 +643,8 @@ impl App {
                             let (a, f) = (apps[i].clone(), file.clone());
                             let once = combo == key!(tab);
                             if !once {
-                                apps::save(mime, &a);
+                                config::set_opener(mime, &a.path);
+                                self.cfg.openers.insert(mime.clone(), a.path.clone());
                             }
                             self.mode = Mode::Browse;
                             self.launch(&a, &f);
@@ -657,7 +657,8 @@ impl App {
                     (_, key!(esc) | key!(left)) => self.mode = Mode::Browse,
                     (_, key!(delete)) => {
                         let m = mime.clone();
-                        apps::forget(&m);
+                        config::forget_opener(&m);
+                        self.cfg.openers.remove(&m);
                         self.mode = Mode::Browse;
                         self.flash(format!("forgot the app for {m}; the next open asks"));
                     }
@@ -788,7 +789,7 @@ impl App {
 
     /// A chord left waiting for a longer one fires once the gap has passed.
     fn expire(&mut self) {
-        if !self.pending.is_empty() && self.pending_at.elapsed() > GAP {
+        if !self.pending.is_empty() && self.pending_at.elapsed() > self.cfg.gap {
             let p = std::mem::take(&mut self.pending);
             if let Some(act) = self.chords.iter().find(|c| c.keys == p).map(|c| c.act.clone()) {
                 self.act(act);
@@ -896,7 +897,7 @@ impl App {
     fn open(&mut self, file: PathBuf, ask: bool) {
         let mime = apps::mime(&file);
         if !ask {
-            if let Some(a) = apps::saved(&mime) {
+            if let Some(a) = self.cfg.openers.get(&mime).and_then(|p| apps::parse(p)) {
                 self.launch(&a, &file);
                 if self.msg.is_none() {
                     self.flash(format!("opened in {}, op picks another", a.name));
@@ -908,7 +909,7 @@ impl App {
         if apps.is_empty() {
             return self.flash("no apps found");
         }
-        let current = apps::saved(&mime).map(|a| a.path);
+        let current = self.cfg.openers.get(&mime).cloned();
         let sel = first_choice(&pick_rows(&apps, handles, "", handles == 0));
         self.mode = Mode::Pick { file, mime, apps, handles, filter: String::new(), sel, current, more: handles == 0 };
     }
@@ -1292,7 +1293,7 @@ impl App {
         let say = match &self.mode {
             Mode::Jump { .. } => "tab or enter goes  ·  ↑ ↓ picks  ·  esc cancels".to_string(),
             Mode::Pick { .. } => "enter opens and remembers  ·  tab just this once  ·  del forgets  ·  esc".to_string(),
-            Mode::Help => "add your own in ~/.config/lealand/chords".to_string(),
+            Mode::Help => "chords are in ~/.config/lealand/lealand.csv, settings in lealand.toml".to_string(),
             _ if !self.pending.is_empty() => return self.chord_hints(),
             _ => {
                 let folders = self.entries.iter().filter(|e| e.dir).count();
@@ -1511,9 +1512,6 @@ const CHROME: u16 = 5;
 /// 4 before the date (9), 3 before git (1) and 2 before the flags.
 const ROW_FIXED: usize = 38;
 
-fn splash_off_file() -> PathBuf {
-    env::var_os("XDG_CONFIG_HOME").map_or_else(|| jump::home().join(".config"), PathBuf::from).join("lealand/no-flag")
-}
 
 fn rgb(v: u32) -> Color {
     Color::Rgb((v >> 16) as u8, (v >> 8) as u8, v as u8)
@@ -1655,17 +1653,12 @@ fn friendly(cmd: &str) -> String {
     name.into()
 }
 
+/// The chords from lealand.csv, one row each: keys, action, command.
 fn load_chords() -> (Vec<Chord>, Option<String>) {
-    let file = env::var_os("XDG_CONFIG_HOME").map_or_else(|| jump::home().join(".config"), PathBuf::from).join("lealand/chords");
-    let user = fs::read_to_string(file).unwrap_or_default();
     let (mut v, mut err): (Vec<Chord>, _) = (Vec::new(), None);
-    for line in DEFAULT_CHORDS.lines().chain(user.lines()) {
-        let mut parts = line.split_whitespace();
-        let Some(keys) = parts.next().filter(|k| !k.starts_with('#')) else { continue };
-        let kind = parts.next().unwrap_or("");
-        let rest = parts.collect::<Vec<_>>().join(" ");
+    for (keys, kind, rest) in config::chord_rows() {
         v.retain(|c| c.keys != keys);
-        let act = match kind {
+        let act = match kind.as_str() {
             "quit" => Action::Quit,
             "help" => Action::Help,
             "full" => Action::Full,
@@ -1677,11 +1670,11 @@ fn load_chords() -> (Vec<Chord>, Option<String>) {
             "spawn" => Action::Spawn(rest),
             "none" => continue,
             _ => {
-                err = Some(format!("chords: {keys} has unknown action {kind:?}"));
+                err = Some(format!("lealand.csv: {keys} has an action I don't know, {kind:?}"));
                 continue;
             }
         };
-        v.push(Chord { keys: keys.into(), act });
+        v.push(Chord { keys, act });
     }
     (v, err)
 }

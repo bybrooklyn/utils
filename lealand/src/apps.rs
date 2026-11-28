@@ -26,33 +26,6 @@ pub fn mime(file: &Path) -> String {
     run("xdg-mime", &["query", "filetype", &file.to_string_lossy()]).unwrap_or_else(|| "application/octet-stream".into())
 }
 
-fn saved_file() -> PathBuf {
-    env::var_os("XDG_CONFIG_HOME").map_or_else(|| super::jump::home().join(".config"), PathBuf::from).join("lealand/apps")
-}
-
-/// The app picked for this type before, if it's still installed.
-pub fn saved(mime: &str) -> Option<App> {
-    let text = fs::read_to_string(saved_file()).ok()?;
-    text.lines().find_map(|l| l.strip_prefix(mime)?.strip_prefix(' ').map(PathBuf::from)).and_then(|p| parse(&p))
-}
-
-pub fn save(mime: &str, app: &App) {
-    let file = saved_file();
-    let old = fs::read_to_string(&file).unwrap_or_default();
-    let mut text: String = old.lines().filter(|l| l.split(' ').next() != Some(mime)).map(|l| format!("{l}\n")).collect();
-    text += &format!("{mime} {}\n", app.path.display());
-    let _ = fs::create_dir_all(file.parent().unwrap());
-    let _ = fs::write(file, text);
-}
-
-/// Drops the pick for this type, so the next open asks again.
-pub fn forget(mime: &str) {
-    let file = saved_file();
-    let old = fs::read_to_string(&file).unwrap_or_default();
-    let text: String = old.lines().filter(|l| l.split(' ').next() != Some(mime)).map(|l| format!("{l}\n")).collect();
-    let _ = fs::write(file, text);
-}
-
 fn dirs() -> Vec<PathBuf> {
     let home = super::jump::home();
     let data = env::var_os("XDG_DATA_DIRS").map_or("/usr/local/share:/usr/share".into(), |s| s.to_string_lossy().into_owned());
@@ -84,7 +57,7 @@ pub fn list(mime: &str) -> (Vec<App>, usize) {
     (all, n)
 }
 
-fn parse(path: &Path) -> Option<App> {
+pub fn parse(path: &Path) -> Option<App> {
     let text = fs::read_to_string(path).ok()?;
     let mut in_entry = false;
     let (mut name, mut generic, mut exec, mut terminal, mut mimes) = (None, String::new(), None, false, Vec::new());
