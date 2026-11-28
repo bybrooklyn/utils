@@ -6,6 +6,7 @@ mod icons;
 mod jump;
 mod logo;
 mod preview;
+mod sysinfo;
 
 use crokey::{KeyCombination, key};
 use ratatui::{
@@ -157,13 +158,14 @@ fn main() {
             return;
         }
         ["--flag"] => return show_flag(),
+        ["fetch"] => return fetch(),
         ["--enable-flag"] => {
             let _ = fs::remove_file(splash_off_file());
             eprintln!("lealand: the launch animation is back");
             return;
         }
         _ => {
-            eprintln!("ll takes no arguments, apart from --flag, --disable-flag and --enable-flag");
+            eprintln!("ll takes no arguments, apart from fetch, --flag, --disable-flag and --enable-flag");
             std::process::exit(2);
         }
     }
@@ -189,6 +191,35 @@ fn main() {
     }
     if let Some(answer) = app.answer {
         let _ = unsafe { File::from_raw_fd(answer_fd) }.write_all(answer.as_bytes());
+    }
+}
+
+/// `ll fetch`: this machine in a few lines, like fastfetch without the logo.
+fn fetch() {
+    use std::io::IsTerminal;
+    let color = io::stdout().is_terminal();
+    let info = sysinfo::all();
+    let w = info.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    let mut out = io::stdout().lock();
+    let user = env::var("USER").unwrap_or_default();
+    let host = fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
+    if color {
+        let _ = writeln!(out, "\n  \x1b[1;38;2;232;225;207m{user}\x1b[0;38;2;93;102;90m@\x1b[1;38;2;158;211;138m{}\x1b[0m", host.trim());
+    } else {
+        let _ = writeln!(out, "{user}@{}", host.trim());
+    }
+    let mut last = "";
+    for (k, v) in &info {
+        let label = if *k == last { "" } else { k }; // gpu, monitor and storage can come more than once
+        last = k;
+        if color {
+            let _ = writeln!(out, "  \x1b[38;2;158;211;138m{label:>w$}\x1b[0m  \x1b[38;2;232;225;207m{v}\x1b[0m");
+        } else {
+            let _ = writeln!(out, "{label:>w$}  {v}");
+        }
+    }
+    if color {
+        let _ = writeln!(out);
     }
 }
 

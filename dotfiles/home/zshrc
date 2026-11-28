@@ -64,8 +64,10 @@ export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/29.0.14206865"
 # The binary prints the folder and maybe a command; this does the cd and runs it.
 unalias ll 2>/dev/null
 ll() {
+    # with arguments (fetch, --flag and so on) it just prints, nothing to cd to
+    if (( $# )); then command ll "$@"; return; fi
     local out
-    out=$(command ll "$@") || return
+    out=$(command ll) || return
     [[ -n $out ]] || return 0
     cd -- "${out%%$'\n'*}" || return
     [[ $out == *$'\n'* ]] && eval "${out#*$'\n'}"
