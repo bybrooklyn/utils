@@ -45,6 +45,14 @@ pub fn save(mime: &str, app: &App) {
     let _ = fs::write(file, text);
 }
 
+/// Drops the pick for this type, so the next open asks again.
+pub fn forget(mime: &str) {
+    let file = saved_file();
+    let old = fs::read_to_string(&file).unwrap_or_default();
+    let text: String = old.lines().filter(|l| l.split(' ').next() != Some(mime)).map(|l| format!("{l}\n")).collect();
+    let _ = fs::write(file, text);
+}
+
 fn dirs() -> Vec<PathBuf> {
     let home = super::jump::home();
     let data = env::var_os("XDG_DATA_DIRS").map_or("/usr/local/share:/usr/share".into(), |s| s.to_string_lossy().into_owned());

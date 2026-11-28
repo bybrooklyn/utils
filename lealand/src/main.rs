@@ -2,6 +2,7 @@
 //! It prints where you ended up (and maybe a command) on stdout; the zsh `ll` function cds and runs it.
 
 mod apps;
+mod icons;
 mod jump;
 mod logo;
 
@@ -92,7 +93,7 @@ enum Mode {
     Browse,
     Help,
     Jump { q: String, at: Instant, sel: usize, hits: Vec<PathBuf> },
-    Pick { file: PathBuf, mime: String, apps: Vec<apps::App>, handles: usize, filter: String, sel: usize },
+    Pick { file: PathBuf, mime: String, apps: Vec<apps::App>, handles: usize, filter: String, sel: usize, current: Option<PathBuf> },
     Name { text: String, then: Option<String> },
     Confirm(PathBuf),
 }
@@ -461,6 +462,12 @@ impl App {
                         }
                     }
                     (_, key!(esc) | key!(left)) => self.mode = Mode::Browse,
+                    (_, key!(delete)) => {
+                        let m = mime.clone();
+                        apps::forget(&m);
+                        self.mode = Mode::Browse;
+                        self.flash(format!("forgot the app for {m}; the next open asks"));
+                    }
                     _ => {}
                 }
             }
@@ -626,14 +633,19 @@ impl App {
         let mime = apps::mime(&file);
         if !ask {
             if let Some(a) = apps::saved(&mime) {
-                return self.launch(&a, &file);
+                self.launch(&a, &file);
+                if self.msg.is_none() {
+                    self.flash(format!("opened in {}, op picks another", a.name));
+                }
+                return;
             }
         }
         let (apps, handles) = apps::list(&mime);
         if apps.is_empty() {
             return self.flash("no apps found");
         }
-        self.mode = Mode::Pick { file, mime, apps, handles, filter: String::new(), sel: 0 };
+        let current = apps::saved(&mime).map(|a| a.path);
+        self.mode = Mode::Pick { file, mime, apps, handles, filter: String::new(), sel: 0, current };
     }
 
     fn launch(&mut self, a: &apps::App, file: &Path) {
@@ -791,10 +803,11 @@ impl App {
                     lines.push(l);
                 }
             }
-            Mode::Pick { file, mime, apps, handles, filter, sel } => {
+            Mode::Pick { file, mime, apps, handles, filter, sel, current } => {
                 let name = file.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
                 left = Line::from(vec![" open ".into(), name.bold(), " with".into()]);
-                right = Line::from(vec![filter.clone().fg(pal::AMBER), format!("  {mime} ").fg(pal::DIM)]);
+                let forget = if current.is_some() { "  del forgets" } else { "" };
+                right = Line::from(vec![filter.clone().fg(pal::AMBER), format!("  {mime}{forget} ").fg(pal::DIM)]);
                 let shown = picked(apps, filter);
                 let start = sel.saturating_sub(rows.saturating_sub(1));
                 for (row, &i) in shown.iter().enumerate().skip(start).take(rows) {
@@ -811,6 +824,10 @@ impl App {
                     if a.terminal {
                         spans.push("  terminal".fg(pal::LINK));
                     }
+                    if current.as_ref() == Some(&a.path) {
+                        spans.push("  current".fg(pal::AMBER));
+                    }
+                    spans[0] = if row == *sel { "▎ ".fg(pal::DIR) } else { "  ".into() };
                     let mut l = Line::from(spans);
                     if row == *sel {
                         l = l.style(Style::new().bg(pal::SEL));
@@ -988,7 +1005,7 @@ impl App {
         let selected = i == self.sel;
         let mut l = Line::from(vec![
             Span::styled(if selected { "▎" } else { " " }, Style::new().fg(pal::DIR)),
-            Span::styled(format!("{} ", icon(e)), base.remove_modifier(Modifier::BOLD)),
+            Span::styled(format!("{} ", icons::icon(&e.name, e.dir, e.link.is_some(), e.mode & 0o111 != 0, selected)), base.remove_modifier(Modifier::BOLD)),
             Span::styled(fit(&name, name_w), base),
             Span::styled(format!("{size:>9}"), dim),
             Span::styled(format!("  {:<9}", ago(e.mtime)), dim),
@@ -1097,7 +1114,7 @@ fn describe(a: &Action) -> String {
         Action::Quit => "quit and cd here".into(),
         Action::Help => "this list".into(),
         Action::Full => "fullscreen with a preview, on and off".into(),
-        Action::OpenWith => "open the file with another app (and remember it)".into(),
+        Action::OpenWith => "pick the app for this kind of file again (del there forgets it)".into(),
         Action::Mkdir(None) => "make a folder here".into(),
         Action::Mkdir(Some(c)) => format!("make a folder, cd into it, run {c}"),
         Action::Trash => "move to the trash (asks first)".into(),
@@ -1289,38 +1306,6 @@ fn ago(t: Option<SystemTime>) -> String {
     }
 }
 
-/// Nerd Font icons, like `eza --icons`.
 fn icon(e: &Entry) -> char {
-    if e.dir {
-        return if e.link.is_some() { '\u{f482}' } else { '\u{f07b}' };
-    }
-    let lower = e.name.to_lowercase();
-    let ext = lower.rsplit_once('.').map_or("", |x| x.1);
-    match ext {
-        "rs" => '\u{e7a8}',
-        "py" => '\u{e73c}',
-        "sh" | "bash" | "zsh" | "fish" => '\u{f489}',
-        "md" | "markdown" | "mdx" => '\u{f48a}',
-        "json" | "jsonc" => '\u{e60b}',
-        "toml" | "yaml" | "yml" | "ini" | "conf" | "cfg" => '\u{e615}',
-        "js" | "mjs" | "cjs" => '\u{e74e}',
-        "ts" | "tsx" => '\u{e628}',
-        "html" | "htm" => '\u{e736}',
-        "css" | "scss" => '\u{e749}',
-        "go" => '\u{e626}',
-        "c" | "h" => '\u{e61e}',
-        "cpp" | "cc" | "hpp" => '\u{e61d}',
-        "lua" => '\u{e620}',
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "avif" | "bmp" | "ico" => '\u{f1c5}',
-        "mp4" | "mkv" | "webm" | "mov" | "avi" => '\u{f1c8}',
-        "mp3" | "flac" | "ogg" | "wav" | "opus" | "m4a" => '\u{f1c7}',
-        "zip" | "tar" | "gz" | "xz" | "zst" | "7z" | "rar" | "bz2" => '\u{f1c6}',
-        "pdf" => '\u{f1c1}',
-        "lock" => '\u{f023}',
-        "txt" | "log" => '\u{f15c}',
-        _ if lower.starts_with(".git") => '\u{f1d3}',
-        _ if e.link.is_some() => '\u{f481}',
-        _ if e.mode & 0o111 != 0 => '\u{f489}',
-        _ => '\u{f15b}',
-    }
+    icons::icon(&e.name, e.dir, e.link.is_some(), e.mode & 0o111 != 0, false)
 }
