@@ -98,7 +98,7 @@ enum Mode {
     Browse,
     Help,
     Jump { q: String, at: Instant, sel: usize, hits: Vec<PathBuf> },
-    Pick { file: PathBuf, mime: String, apps: Vec<apps::App>, handles: usize, filter: String, sel: usize, current: Option<PathBuf> },
+    Pick { file: PathBuf, mime: String, apps: Vec<apps::App>, handles: usize, filter: String, sel: usize, current: Option<PathBuf>, more: bool },
     Name { text: String, then: Option<String> },
     Confirm(PathBuf),
 }
@@ -420,7 +420,7 @@ impl App {
             Mode::Browse | Mode::Name { .. } | Mode::Confirm(_) => self.entries.len().max(1),
             Mode::Help => 999, // as tall as the terminal
             Mode::Jump { .. } => self.entries.len().max(8),
-            Mode::Pick { .. } => 12,
+            Mode::Pick { apps, handles, filter, more, .. } => pick_rows(apps, *handles, filter, *more).len().clamp(3, 16),
         };
         let cap = if matches!(self.mode, Mode::Help) { terminal::size().map_or(24, |s| s.1) } else { self.max_height() };
         (want as u16 + CHROME).min(cap)
@@ -614,27 +614,46 @@ impl App {
                     _ => self.mode = Mode::Browse,
                 }
             }
-            Mode::Pick { file, mime, apps, filter, sel, .. } => {
-                let shown = picked(apps, filter);
+            Mode::Pick { file, mime, apps, handles, filter, sel, more, .. } => {
+                let rows = pick_rows(apps, *handles, filter, *more);
+                let step = |from: usize, down: bool| {
+                    let mut i = from;
+                    loop {
+                        i = if down { i + 1 } else { i.wrapping_sub(1) };
+                        match rows.get(i) {
+                            Some(PickRow::Heading(_)) => continue,
+                            Some(_) => return i,
+                            None => return from,
+                        }
+                    }
+                };
                 match (ch, combo) {
                     (Some(c), _) => {
                         filter.push(c);
-                        *sel = 0;
+                        *sel = first_choice(&pick_rows(apps, *handles, filter, *more));
                     }
                     (_, key!(backspace)) => {
                         filter.pop();
-                        *sel = 0;
+                        *sel = first_choice(&pick_rows(apps, *handles, filter, *more));
                     }
-                    (_, key!(up)) => *sel = sel.saturating_sub(1),
-                    (_, key!(down)) => *sel = (*sel + 1).min(shown.len().saturating_sub(1)),
-                    (_, key!(enter) | key!(right) | key!(tab)) => {
-                        if let Some(&i) = shown.get(*sel) {
+                    (_, key!(up)) => *sel = step(*sel, false),
+                    (_, key!(down)) => *sel = step(*sel, true),
+                    (_, key!(enter) | key!(right) | key!(tab)) => match rows.get(*sel) {
+                        Some(PickRow::More(_)) => *more = true,
+                        Some(&PickRow::App(i)) => {
                             let (a, f) = (apps[i].clone(), file.clone());
-                            apps::save(mime, &a);
+                            let once = combo == key!(tab);
+                            if !once {
+                                apps::save(mime, &a);
+                            }
                             self.mode = Mode::Browse;
                             self.launch(&a, &f);
+                            if once && self.msg.is_none() {
+                                self.flash(format!("opened in {} just this once", a.name));
+                            }
                         }
-                    }
+                        _ => {}
+                    },
                     (_, key!(esc) | key!(left)) => self.mode = Mode::Browse,
                     (_, key!(delete)) => {
                         let m = mime.clone();
@@ -890,7 +909,8 @@ impl App {
             return self.flash("no apps found");
         }
         let current = apps::saved(&mime).map(|a| a.path);
-        self.mode = Mode::Pick { file, mime, apps, handles, filter: String::new(), sel: 0, current };
+        let sel = first_choice(&pick_rows(&apps, handles, "", handles == 0));
+        self.mode = Mode::Pick { file, mime, apps, handles, filter: String::new(), sel, current, more: handles == 0 };
     }
 
     fn launch(&mut self, a: &apps::App, file: &Path) {
@@ -1051,38 +1071,45 @@ impl App {
                     lines.push(l);
                 }
             }
-            Mode::Pick { file, mime, apps, handles, filter, sel, current } => {
+            Mode::Pick { file, mime, apps, handles, filter, sel, current, more } => {
                 let name = file.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
-                left = Line::from(vec!["   open ".fg(pal::TEXT), name.bold(), " with".into()]);
-                let forget = if current.is_some() { "  del forgets" } else { "" };
-                right = Line::from(vec![filter.clone().fg(pal::AMBER), format!("  {mime}{forget} ").fg(pal::DIM)]);
-                let shown = picked(apps, filter);
-                let start = sel.saturating_sub(rows.saturating_sub(1));
-                for (row, &i) in shown.iter().enumerate().skip(start).take(rows) {
-                    let a = &apps[i];
-                    let fits = i < *handles;
-                    let mut spans = vec![
-                        "  ".into(),
-                        if fits { a.name.clone().bold() } else { a.name.clone().fg(pal::DIM) },
-                        format!("  {}", a.generic).fg(pal::DIM),
-                    ];
-                    if i == 0 && fits && filter.is_empty() {
-                        spans.push("  default".fg(pal::DIR));
-                    }
-                    if a.terminal {
-                        spans.push("  terminal".fg(pal::LINK));
-                    }
-                    if current.as_ref() == Some(&a.path) {
-                        spans.push("  current".fg(pal::AMBER));
-                    }
-                    spans[0] = if row == *sel { " ▎ ".fg(pal::DIR) } else { "   ".into() };
-                    let mut l = Line::from(spans);
-                    if row == *sel {
+                left = Line::from(vec!["   open ".fg(pal::TEXT), name.fg(pal::TEXT).bold(), " with".fg(pal::TEXT)]);
+                right = if filter.is_empty() {
+                    Line::from(format!("{mime} ").fg(pal::DIM))
+                } else {
+                    Line::from(vec!["search ".fg(pal::DIM), filter.clone().fg(pal::AMBER).bold(), "▏ ".fg(pal::AMBER)])
+                };
+                let list = pick_rows(apps, *handles, filter, *more);
+                let name_w = list.iter().filter_map(|r| if let PickRow::App(i) = r { Some(apps[*i].name.chars().count()) } else { None }).max().unwrap_or(0).min(28);
+                let start = sel.saturating_sub(rows.saturating_sub(2));
+                for (row, item) in list.iter().enumerate().skip(start).take(rows) {
+                    let chosen = row == *sel;
+                    let mark = if chosen { " ▎ ".fg(pal::DIR) } else { "   ".into() };
+                    let mut l = match item {
+                        PickRow::Heading(t) => Line::from(Span::styled(format!("   {t}"), Style::new().fg(pal::DIR).add_modifier(Modifier::ITALIC))),
+                        PickRow::More(n) => Line::from(vec![mark, "\u{f141}  ".fg(pal::DIM), format!("other apps ({n})").fg(pal::TEXT), "    enter shows them, or type to search".fg(pal::FAINT)]),
+                        PickRow::App(i) => {
+                            let a = &apps[*i];
+                            let icon = if a.terminal { "\u{f489}  " } else { "\u{f2d0}  " };
+                            let mut spans = vec![mark, icon.fg(pal::DIR), fit(&a.name, name_w).fg(pal::TEXT).bold(), format!("   {}", a.generic).fg(pal::DIM)];
+                            if *i == 0 && *i < *handles {
+                                spans.push("   default".fg(pal::DIR));
+                            }
+                            if current.as_ref() == Some(&a.path) {
+                                spans.push("   current".fg(pal::AMBER));
+                            }
+                            if a.terminal {
+                                spans.push("   terminal".fg(pal::LINK));
+                            }
+                            Line::from(spans)
+                        }
+                    };
+                    if chosen {
                         l = l.style(Style::new().bg(pal::SEL));
                     }
                     lines.push(l);
                 }
-                if shown.is_empty() {
+                if list.is_empty() {
                     lines.push(Line::from("   nothing matches".fg(pal::DIM)));
                 }
             }
@@ -1264,7 +1291,7 @@ impl App {
     fn footer(&self) -> Line<'static> {
         let say = match &self.mode {
             Mode::Jump { .. } => "tab or enter goes  ·  ↑ ↓ picks  ·  esc cancels".to_string(),
-            Mode::Pick { .. } => "enter opens  ·  type to filter  ·  del forgets  ·  esc cancels".to_string(),
+            Mode::Pick { .. } => "enter opens and remembers  ·  tab just this once  ·  del forgets  ·  esc".to_string(),
             Mode::Help => "add your own in ~/.config/lealand/chords".to_string(),
             _ if !self.pending.is_empty() => return self.chord_hints(),
             _ => {
@@ -1547,9 +1574,54 @@ fn thousands(n: usize) -> String {
     out
 }
 
-fn picked(apps: &[apps::App], filter: &str) -> Vec<usize> {
+enum PickRow {
+    Heading(String),
+    App(usize),
+    More(usize),
+}
+
+/// The picker's rows: the apps for this kind of file, then the rest folded into one row until
+/// you open it or search.
+fn pick_rows(apps: &[apps::App], handles: usize, filter: &str, more: bool) -> Vec<PickRow> {
     let f = filter.to_lowercase();
-    (0..apps.len()).filter(|&i| f.is_empty() || apps[i].name.to_lowercase().contains(&f)).collect()
+    let hit = |i: &usize| {
+        let a = &apps[*i];
+        let name = a.name.to_lowercase();
+        let initials: String = name.split_whitespace().filter_map(|w| w.chars().next()).collect();
+        let command = a.exec.split_whitespace().next().unwrap_or("").rsplit('/').next().unwrap_or("").to_lowercase();
+        f.is_empty() || name.contains(&f) || initials.starts_with(&f) || command.starts_with(&f) || a.generic.to_lowercase().contains(&f)
+    };
+    // when searching, names that start with it (or whose initials or command do) come first
+    let rank = |i: &usize| {
+        let a = &apps[*i];
+        let name = a.name.to_lowercase();
+        let initials: String = name.split_whitespace().filter_map(|w| w.chars().next()).collect();
+        !(name.starts_with(&f) || initials.starts_with(&f) || a.exec.to_lowercase().starts_with(&f))
+    };
+    let mut mine: Vec<usize> = (0..handles).filter(hit).collect();
+    let mut rest: Vec<usize> = (handles..apps.len()).filter(hit).collect();
+    if !f.is_empty() {
+        mine.sort_by_key(rank);
+        rest.sort_by_key(rank);
+    }
+    let mut rows = Vec::new();
+    if !mine.is_empty() {
+        rows.push(PickRow::Heading("made for this kind of file".into()));
+        rows.extend(mine.into_iter().map(PickRow::App));
+    }
+    if !rest.is_empty() {
+        if more || !f.is_empty() {
+            rows.push(PickRow::Heading("other apps".into()));
+            rows.extend(rest.into_iter().map(PickRow::App));
+        } else {
+            rows.push(PickRow::More(rest.len()));
+        }
+    }
+    rows
+}
+
+fn first_choice(rows: &[PickRow]) -> usize {
+    rows.iter().position(|r| !matches!(r, PickRow::Heading(_))).unwrap_or(0)
 }
 
 fn describe(a: &Action) -> String {
