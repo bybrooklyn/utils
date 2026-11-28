@@ -119,7 +119,8 @@ struct App {
     tty_cmd: Option<Command>,
     tty_wait: bool,
     cfg: config::Config,
-    sys: Option<Vec<(&'static str, String)>>,
+    sys: Option<Vec<Line<'static>>>,
+    help_scroll: usize,
     intro: Option<Instant>,
     cascade: Option<Instant>,
     outro: Option<Instant>,
@@ -180,32 +181,22 @@ fn main() {
     }
 }
 
-/// `ll fetch`: this machine in a few lines, like fastfetch without the logo.
+/// `ll fetch`: this machine, grouped and coloured, like fastfetch without the logo.
 fn fetch() {
     use std::io::IsTerminal;
-    let color = io::stdout().is_terminal();
-    let info = sysinfo::all();
-    let w = info.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
-    let mut out = io::stdout().lock();
-    let user = env::var("USER").unwrap_or_default();
-    let host = fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
-    if color {
-        let _ = writeln!(out, "\n  \x1b[1;38;2;232;225;207m{user}\x1b[0;38;2;93;102;90m@\x1b[1;38;2;158;211;138m{}\x1b[0m", host.trim());
+    let mut lines = sysinfo::lines(&sysinfo::all(), true);
+    if io::stdout().is_terminal() {
+        let swatch: Vec<Span> = [pal::DIR, pal::LEAF, pal::LINK, pal::LILAC, pal::ROSE, pal::AMBER, pal::RED, pal::TEXT, pal::DIM]
+            .into_iter()
+            .map(|c| Span::styled("███", Style::new().fg(c)))
+            .collect();
+        lines.push(Line::default());
+        lines.push(Line::from(swatch));
+        print!("\n{}\n", sysinfo::ansi(&lines));
     } else {
-        let _ = writeln!(out, "{user}@{}", host.trim());
-    }
-    let mut last = "";
-    for (k, v) in &info {
-        let label = if *k == last { "" } else { k }; // gpu, monitor and storage can come more than once
-        last = k;
-        if color {
-            let _ = writeln!(out, "  \x1b[38;2;158;211;138m{label:>w$}\x1b[0m  \x1b[38;2;232;225;207m{v}\x1b[0m");
-        } else {
-            let _ = writeln!(out, "{label:>w$}  {v}");
+        for l in &lines {
+            println!("{}", l.spans.iter().map(|s| s.content.as_ref()).collect::<String>());
         }
-    }
-    if color {
-        let _ = writeln!(out);
     }
 }
 
@@ -374,6 +365,7 @@ impl App {
             tty_wait: false,
             cfg,
             sys: None,
+            help_scroll: 0,
             intro: None,
             cascade: None,
             outro: None,
@@ -579,7 +571,16 @@ impl App {
             _ => None,
         };
         match &mut self.mode {
-            Mode::Help => self.mode = Mode::Browse,
+            Mode::Help => match combo {
+                key!(down) => self.help_scroll += 1,
+                key!(up) => self.help_scroll = self.help_scroll.saturating_sub(1),
+                key!(pagedown) => self.help_scroll += 10,
+                key!(pageup) => self.help_scroll = self.help_scroll.saturating_sub(10),
+                _ => {
+                    self.help_scroll = 0;
+                    self.mode = Mode::Browse;
+                }
+            },
             Mode::Confirm(path) => {
                 let p = path.clone();
                 self.mode = Mode::Browse;
@@ -1123,8 +1124,10 @@ impl App {
                     Span::styled("lealand", Style::new().fg(pal::DIR).add_modifier(Modifier::ITALIC)),
                     "   chords, keys and this machine".fg(pal::TEXT).bold(),
                 ]);
-                right = Line::from("any key closes ".fg(pal::DIM));
-                lines = self.help_lines(body.width as usize, rows);
+                right = Line::from("? again or esc closes ".fg(pal::DIM));
+                let all = self.help_lines(body.width as usize);
+                self.help_scroll = self.help_scroll.min(all.len().saturating_sub(rows));
+                lines = all.into_iter().skip(self.help_scroll).collect();
             }
             Mode::Jump { q, sel, hits, .. } => {
                 let top = hits.get(*sel);
@@ -1292,73 +1295,131 @@ impl App {
         f.render_widget(Paragraph::new(lines), f.area());
     }
 
-    /// The ? screen: the wordmark if there's room, then this machine beside the chords and keys.
-    fn help_lines(&mut self, width: usize, rows: usize) -> Vec<Line<'static>> {
-        let heading = |t: &str| Line::from(Span::styled(format!("  {t}"), Style::new().fg(pal::DIR).add_modifier(Modifier::ITALIC)));
-        let sys = self.sys.get_or_insert_with(sysinfo::all).clone();
-        let label_w = sys.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
-        let mut machine = vec![heading("this machine")];
-        let mut last = "";
-        for (k, v) in &sys {
-            let label = if *k == last { "" } else { k };
-            last = k;
-            machine.push(Line::from(vec![format!("    {label:>label_w$}  ").fg(pal::DIM), v.clone().fg(pal::TEXT)]));
-        }
-        let mut keys = vec![heading("chords, typed quickly")];
-        for c in &self.chords {
-            keys.push(Line::from(vec![format!("    {:<10}", c.keys).fg(pal::AMBER).bold(), describe(&c.act).fg(pal::TEXT)]));
-        }
-        keys.push(Line::default());
-        keys.push(heading("keys"));
-        for (k, d) in [
-            ("← →", "up a folder (not past ~) / open, run"),
-            ("↑ ↓", "move, with ctrl 5 at a time"),
-            ("pgup pgdn", "a page, home and end for first and last"),
-            ("backspace", "back to the last folder"),
-            ("/", "jump to any folder: type a bit, tab to go"),
-            (":", "cd somewhere, or run a shell command here"),
-            ("mouse", "click picks, click again opens, wheel moves"),
-            ("esc esc", "quit, shell stays where it was"),
-        ] {
-            keys.push(Line::from(vec![format!("    {k:<10}").fg(pal::LINK).bold(), d.fg(pal::TEXT)]));
-        }
-        let col = machine.iter().map(|l| l.width()).max().unwrap_or(0) + 4;
-        let side_by_side = width >= col + keys.iter().map(|l| l.width()).max().unwrap_or(0);
-        let mut body: Vec<Line<'static>> = Vec::new();
-        if side_by_side {
-            for i in 0..machine.len().max(keys.len()) {
-                let mut spans = machine.get(i).cloned().unwrap_or_default().spans;
-                let w: usize = spans.iter().map(|s| s.width()).sum();
-                spans.push(Span::raw(" ".repeat(col.saturating_sub(w))));
-                spans.extend(keys.get(i).cloned().unwrap_or_default().spans);
-                body.push(Line::from(spans));
+    /// The ? screen: the wordmark with this machine beside it (or under it when it's narrow), then
+    /// the chords in groups and the keys, each as a little key cap.
+    fn help_lines(&mut self, width: usize) -> Vec<Line<'static>> {
+        let info = self.sys.get_or_insert_with(|| sysinfo::lines(&sysinfo::all(), true)).clone();
+        let indent = |l: Line<'static>, n: usize| {
+            let mut spans = vec![Span::raw(" ".repeat(n))];
+            spans.extend(l.spans);
+            Line::from(spans)
+        };
+        let logo: Vec<Line<'static>> = logo::LOGO
+            .iter()
+            .map(|row| {
+                Line::from(
+                    row.iter()
+                        .map(|&(c, fg, bg)| {
+                            let mut st = Style::new().fg(rgb(fg));
+                            if let Some(b) = bg {
+                                st = st.bg(rgb(b));
+                            }
+                            Span::styled(c.to_string(), st)
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        let logo_w = logo.iter().map(|l| l.width()).max().unwrap_or(0);
+        let info_w = info.iter().map(|l| l.width()).max().unwrap_or(0);
+        let mut out: Vec<Line<'static>> = Vec::new();
+        if width >= 2 + logo_w + 4 + info_w {
+            // side by side, the card centred against the logo
+            let top = logo.len().saturating_sub(info.len()) / 2;
+            for i in 0..logo.len().max(info.len() + top) {
+                let mut spans = vec![Span::raw("  ")];
+                let l = logo.get(i).cloned().unwrap_or_default();
+                let w = l.width();
+                spans.extend(l.spans);
+                spans.push(Span::raw(" ".repeat(logo_w - w + 4)));
+                if let Some(x) = i.checked_sub(top).and_then(|k| info.get(k)) {
+                    spans.extend(x.spans.clone());
+                }
+                out.push(Line::from(spans));
             }
         } else {
-            body = machine;
-            body.push(Line::default());
-            body.extend(keys);
+            if width >= logo_w + 2 {
+                out.extend(logo.into_iter().map(|l| indent(l, 2)));
+                out.push(Line::default());
+            }
+            out.extend(info.into_iter().map(|l| indent(l, 2)));
         }
-        let logo_w = logo::LOGO.iter().map(|r| r.len()).max().unwrap_or(0) + 2;
-        if rows >= body.len() + logo::LOGO.len() + 1 && width >= logo_w {
-            let mut out: Vec<Line<'static>> = logo::LOGO
+        out.push(Line::default());
+
+        // chords and keys, in groups laid out as columns
+        let cap = |k: &str| Span::styled(format!(" {k} "), Style::new().fg(pal::AMBER).bg(Color::Rgb(0x2a, 0x33, 0x2c)).add_modifier(Modifier::BOLD));
+        let mut groups: Vec<(&str, Vec<(String, String)>)> = vec![("open and run", vec![]), ("make and tidy", vec![]), ("lealand", vec![])];
+        for c in &self.chords {
+            let g = match c.act {
+                Action::Mkdir(_) | Action::Trash => 1,
+                Action::Quit | Action::Help | Action::Full => 2,
+                _ => 0,
+            };
+            groups[g].1.push((c.keys.clone(), describe(&c.act)));
+        }
+        groups.insert(
+            2,
+            (
+                "move around",
+                [
+                    ("← →", "up a folder, or open / run"),
+                    ("↑ ↓", "move, ctrl for 5 at a time"),
+                    ("pgup pgdn", "a page at a time"),
+                    ("backspace", "back to the last folder"),
+                    ("/", "jump to any folder"),
+                    (":", "cd, or a shell command"),
+                    ("mouse", "click, click again, wheel"),
+                    ("esc esc", "quit, shell stays put"),
+                ]
                 .iter()
-                .map(|row| {
-                    let mut spans = vec![Span::raw("  ")];
-                    for &(c, fg, bg) in row.iter() {
-                        let mut st = Style::new().fg(rgb(fg));
-                        if let Some(b) = bg {
-                            st = st.bg(rgb(b));
-                        }
-                        spans.push(Span::styled(c.to_string(), st));
-                    }
-                    Line::from(spans)
-                })
-                .collect();
+                .map(|(k, d)| (k.to_string(), d.to_string()))
+                .collect(),
+            ),
+        );
+        let cols: Vec<Vec<Line<'static>>> = groups
+            .into_iter()
+            .filter(|(_, items)| !items.is_empty())
+            .map(|(title, items)| {
+                let kw = items.iter().map(|(k, _)| k.chars().count()).max().unwrap_or(0);
+                let mut col = vec![Line::from(Span::styled(title.to_string(), Style::new().fg(pal::DIR).add_modifier(Modifier::ITALIC)))];
+                for (k, d) in items {
+                    col.push(Line::from(vec![cap(&k), Span::raw(" ".repeat(kw - k.chars().count() + 2)), d.fg(pal::TEXT)]));
+                }
+                col
+            })
+            .collect();
+        // as many columns side by side as fit, then the next row of them
+        let mut row: Vec<&Vec<Line<'static>>> = Vec::new();
+        let mut used = 2;
+        let flush = |row: &mut Vec<&Vec<Line<'static>>>, out: &mut Vec<Line<'static>>| {
+            if row.is_empty() {
+                return;
+            }
+            let widths: Vec<usize> = row.iter().map(|c| c.iter().map(|l| l.width()).max().unwrap_or(0) + 4).collect();
+            for i in 0..row.iter().map(|c| c.len()).max().unwrap_or(0) {
+                let mut spans = vec![Span::raw("  ")];
+                for (c, w) in row.iter().zip(&widths) {
+                    let l = c.get(i).cloned().unwrap_or_default();
+                    let lw = l.width();
+                    spans.extend(l.spans);
+                    spans.push(Span::raw(" ".repeat(w - lw)));
+                }
+                out.push(Line::from(spans));
+            }
             out.push(Line::default());
-            out.extend(body);
-            return out;
+            row.clear();
+        };
+        for c in &cols {
+            let w = c.iter().map(|l| l.width()).max().unwrap_or(0) + 4;
+            if used + w > width && !row.is_empty() {
+                flush(&mut row, &mut out);
+                used = 2;
+            }
+            row.push(c);
+            used += w;
         }
-        body
+        flush(&mut row, &mut out);
+        out
     }
 
     /// While a chord is half typed: the keys that can come next and what they do.
@@ -1382,7 +1443,7 @@ impl App {
             Mode::Jump { .. } => "tab or enter goes  ·  ↑ ↓ picks  ·  esc cancels".to_string(),
             Mode::Cmd { .. } => "cd somewhere, or any shell command here  ·  tab completes  ·  ↑ ↓ earlier ones  ·  esc".to_string(),
             Mode::Pick { .. } => "enter opens and remembers  ·  tab just this once  ·  del forgets  ·  esc".to_string(),
-            Mode::Help => "chords are in ~/.config/lealand/lealand.csv, settings in lealand.toml".to_string(),
+            Mode::Help => "↑ ↓ scroll  ·  any other key closes  ·  chords in ~/.config/lealand/lealand.csv, settings in lealand.toml".to_string(),
             _ if !self.pending.is_empty() => return self.chord_hints(),
             _ => {
                 let folders = self.entries.iter().filter(|e| e.dir).count();

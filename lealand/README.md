@@ -37,7 +37,7 @@ Each key of a chord has to come within a second of the last one, and while you'r
 - **mk** make a folder. Type its name in the top line and press Enter
 - **mkcl** make a folder, cd into it and run `claude`
 - **rm** move the file or folder to the trash, after a y/n
-- **?** the wordmark, this machine (CPU, GPU, memory, monitors, storage) and all the chords and keys
+- **?** the wordmark beside this machine's details, then every chord and key as key caps in groups. ↑ ↓ scroll it when it doesn't fit
 
 The chords live in `~/.config/lealand/lealand.csv`, one per row, so a spreadsheet can edit them too:
 
@@ -68,7 +68,7 @@ The first run writes `~/.config/lealand/lealand.toml` with every setting and a c
 
 ## ll fetch
 
-`ll fetch` prints this machine in a few lines, like fastfetch without the logo: OS, kernel, uptime, desktop, shell, terminal, CPU, GPUs, memory, monitors (by the names in their EDID) and storage. It takes about 7 ms.
+`ll fetch` prints this machine like fastfetch without the logo, in groups: the system (OS, board, kernel, uptime, packages, desktop, shell, terminal, language), the hardware (CPU with its top clock and temperature, each GPU with its driver, memory and swap with bars), each monitor by the name in its EDID with its resolution, refresh rate, scale and HDR from KDE, each disk with a bar and its filesystem, and the local IP addresses. It takes well under a tenth of a second. The `?` screen shows the same card beside the wordmark.
 
 ## Starting up
 
