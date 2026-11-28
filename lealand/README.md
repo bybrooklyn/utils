@@ -20,17 +20,18 @@ The listing is only as wide as its longest name. The last column is empty unless
 - **backspace** goes back to the folder you were in before.
 - **/** jumps to any folder. Type part of its name and press tab.
 - **esc esc** quits and leaves the shell where it was.
+- **the mouse** works too: click a row to pick it, click it again to open it, scroll with the wheel.
 
 ## Chords
 
-Each key of a chord has to come within 300 ms of the last one. When a chord is also the start of a longer one, like `mk` and `mkcl`, it waits those 300 ms for the next key before it runs.
+Each key of a chord has to come within a second of the last one, and while you're partway through, the bottom line shows what can come next. When a chord is also the start of a longer one, like `mk` and `mkcl`, it waits that second for the next key, or Enter or space runs it straight away.
 
 - **qq** quit and cd to where you are
 - **cl** quit, cd, and run `claude`
 - **fi** open Dolphin here (ll stays open)
 - **code** open VS Code here
 - **tt** open a new Ghostty tab here
-- **fu** fullscreen, with a preview of the file or folder under the cursor, and back
+- **fu** fullscreen, with a preview of the file or folder under the cursor, and back. Code is coloured by bat, pictures are drawn for real in Ghostty (kitty and WezTerm too), and folders show their total size
 - **op** open the file with a different app
 - **mk** make a folder. Type its name in the top line and press Enter
 - **mkcl** make a folder, cd into it and run `claude`
@@ -62,7 +63,7 @@ The first time you open a type of file, ll lists the apps that handle it, with K
 
 ## Starting up
 
-It opens with a short animation: a few lines on what it read, then the willow, which dissolves into the listing. It takes about a second, and any key skips it and still does what that key does. `ll --disable-flag` turns it off for good and `ll --enable-flag` brings it back. It also skips itself in terminals under 82 columns or 26 rows.
+It opens with a short animation: a few lines on what it read, then the willow, which dissolves into the listing. It takes about a second, and any key skips it and still does what that key does. Quitting has one too: the listing falls apart into leaves. `ll --disable-flag` turns both off for good and `ll --enable-flag` brings them back. `ll --flag` just shows the wordmark. `lealand` works as a name for `ll` too. It also skips itself in terminals under 82 columns or 26 rows.
 
 ## Install
 

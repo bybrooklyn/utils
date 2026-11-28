@@ -5,6 +5,7 @@ mod apps;
 mod icons;
 mod jump;
 mod logo;
+mod preview;
 
 use crokey::{KeyCombination, key};
 use ratatui::{
@@ -120,6 +121,12 @@ struct App {
     counts: HashMap<PathBuf, Option<usize>>,
     widths: Option<(usize, usize)>,
     preview: Option<(PathBuf, Vec<Line<'static>>)>,
+    image: Option<(PathBuf, Vec<u8>, u32, u32)>,
+    image_area: Rect,
+    shown_image: Option<PathBuf>,
+    sizes: HashMap<PathBuf, Option<u64>>,
+    sizes_rx: mpsc::Receiver<(PathBuf, u64)>,
+    sizes_tx: mpsc::Sender<(PathBuf, u64)>,
     msg: Option<(String, Instant)>,
     index: Arc<jump::Index>,
     uid: u32,
@@ -266,6 +273,7 @@ fn run(app: &mut App) -> io::Result<()> {
             term = inline(h)?;
         }
         term.draw(|f| app.draw(f))?;
+        app.place_image()?;
         let wait = if app.busy() { Duration::from_millis(30) } else { Duration::from_secs(1) };
         if event::poll(wait)? {
             match event::read()? {
@@ -301,6 +309,7 @@ fn run(app: &mut App) -> io::Result<()> {
 impl App {
     fn new(dir: PathBuf) -> Self {
         let (chords, err) = load_chords();
+        let (sizes_tx, sizes_rx) = mpsc::channel();
         let mut app = App {
             entries: read_entries(&dir).unwrap_or_default(),
             dir: dir.clone(),
@@ -320,6 +329,12 @@ impl App {
             counts: HashMap::new(),
             widths: None,
             preview: None,
+            image: None,
+            image_area: Rect::default(),
+            shown_image: None,
+            sizes: HashMap::new(),
+            sizes_rx,
+            sizes_tx,
             msg: err.map(|e| (e, Instant::now())),
             index: jump::start(),
             uid: unsafe { libc::getuid() },
@@ -375,6 +390,55 @@ impl App {
             || self.msg.is_some()
             || self.git_rx.is_some()
             || matches!(self.mode, Mode::Jump { .. })
+    }
+
+    /// A folder's total size, worked out by du in the background; None until it's known.
+    fn folder_size(&mut self, path: &Path) -> Option<u64> {
+        while let Ok((p, n)) = self.sizes_rx.try_recv() {
+            self.sizes.insert(p, Some(n));
+        }
+        if let Some(n) = self.sizes.get(path) {
+            return *n;
+        }
+        self.sizes.insert(path.to_path_buf(), None);
+        let (tx, p) = (self.sizes_tx.clone(), path.to_path_buf());
+        thread::spawn(move || {
+            let out = Command::new("du").arg("-sb").arg(&p).stdin(Stdio::null()).stderr(Stdio::null()).output();
+            let n = out.ok().and_then(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().next()?.parse().ok());
+            if let Some(n) = n {
+                let _ = tx.send((p, n));
+            }
+        });
+        None
+    }
+
+    /// Puts the selected picture over the preview pane, or takes the old one away.
+    fn place_image(&mut self) -> io::Result<()> {
+        let want = match (&self.image, self.selected()) {
+            (Some((p, ..)), Some(e)) if self.full && *p == e.path && preview::can_draw_images() => Some(p.clone()),
+            _ => None,
+        };
+        if want == self.shown_image {
+            return Ok(());
+        }
+        let mut out = io::stdout();
+        out.write_all(preview::CLEAR.as_bytes())?;
+        if let (Some(_), Some((_, png, w, h))) = (&want, &self.image) {
+            let a = self.image_area;
+            let ws = terminal::window_size().ok();
+            let (cw, ch) = ws.filter(|s| s.width > 0 && s.columns > 0).map_or((10.0, 20.0), |s| {
+                (s.width as f64 / s.columns as f64, s.height as f64 / s.rows as f64)
+            });
+            // as big as fits in the pane without stretching
+            let scale = (a.width as f64 * cw / *w as f64).min(a.height as f64 * ch / *h as f64).min(1.0); // never blown up past its own size
+            let cols = ((*w as f64 * scale / cw).round() as u16).clamp(1, a.width.max(1));
+            let rows = ((*h as f64 * scale / ch).round() as u16).clamp(1, a.height.max(1));
+            execute!(out, cursor::MoveTo(a.x, a.y))?;
+            out.write_all(preview::kitty(png, cols, rows).as_bytes())?;
+        }
+        out.flush()?;
+        self.shown_image = want;
+        Ok(())
     }
 
     fn flash(&mut self, s: impl Into<String>) {
@@ -985,17 +1049,26 @@ impl App {
         f.render_widget(Paragraph::new(self.footer()), foot);
         if let Some(side) = side {
             let side = Rect { y: side.y + 1, height: side.height.saturating_sub(1), ..side };
-            let lines = self.preview_lines(side.height.saturating_sub(2) as usize);
+            let lines = self.preview_lines(side.height.saturating_sub(2) as usize, side.width.saturating_sub(2));
             let title = self.selected().map(|e| {
                 let what = if e.dir { format!("{}/", e.name) } else { e.name.clone() };
                 Line::from(vec![" ".into(), what.fg(pal::TEXT).bold(), " ".into()])
             });
+            let info = self.selected().map(|e| (e.dir, e.path.clone(), e.size, e.mtime));
+            let about = info.map(|(dir, path, size, mtime)| {
+                let size = if dir { self.folder_size(&path).map_or("…".into(), human) } else { human(size) };
+                Line::from(format!(" {size}  ·  {} ", ago(mtime)).fg(pal::DIM)).right_aligned()
+            });
+            self.image_area = Rect { x: side.x + 2, y: side.y + 1, width: side.width.saturating_sub(3), height: side.height.saturating_sub(2) };
             let mut block = ratatui::widgets::Block::new()
                 .borders(ratatui::widgets::Borders::LEFT | ratatui::widgets::Borders::TOP)
                 .border_type(ratatui::widgets::BorderType::Rounded)
                 .border_style(Style::new().fg(pal::FAINT));
             if let Some(t) = title {
                 block = block.title(t);
+            }
+            if let Some(a) = about {
+                block = block.title(a);
             }
             f.render_widget(Paragraph::new(lines).block(block), side);
         }
@@ -1211,7 +1284,7 @@ impl App {
         l
     }
 
-    fn preview_lines(&mut self, n: usize) -> Vec<Line<'static>> {
+    fn preview_lines(&mut self, n: usize, width: u16) -> Vec<Line<'static>> {
         let Some(e) = self.selected() else { return Vec::new() };
         let path = e.path.clone();
         if let Some((p, lines)) = &self.preview {
@@ -1233,11 +1306,22 @@ impl App {
                     .collect(),
                 Err(e) => vec![Line::from(format!(" {}", e.kind()).fg(pal::RED))],
             }
+        } else if preview::is_image(&path) {
+            match preview::png(&path) {
+                Some((png, w, h)) => {
+                    let say = if preview::can_draw_images() { String::new() } else { format!(" a picture, {w} × {h}") };
+                    self.image = Some((path.clone(), png, w, h));
+                    vec![Line::from(say.fg(pal::DIM))]
+                }
+                None => vec![Line::from(" a picture ImageMagick couldn't read".fg(pal::DIM))],
+            }
         } else {
             let mut buf = vec![0; 64 * 1024];
             let got = File::open(&path).and_then(|mut f| f.read(&mut buf)).unwrap_or(0);
             buf.truncate(got);
-            if buf.contains(&0) {
+            if let Some(lines) = (!buf.contains(&0)).then(|| preview::text(&path, n, width)).flatten() {
+                lines
+            } else if buf.contains(&0) {
                 vec![Line::from(format!(" binary, {}", human(e.size)).fg(pal::DIM))]
             } else {
                 String::from_utf8_lossy(&buf)
