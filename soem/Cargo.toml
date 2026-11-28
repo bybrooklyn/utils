@@ -1,0 +1,18 @@
+[package]
+name = "soem"
+version = "0.1.0"
+edition = "2024"
+description = "Source Overview and Enumeration Metrics: lines of code per folder"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+ignore = "0.4"
+libc = "0.2.191"
+tokei = { version = "15", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
