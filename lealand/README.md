@@ -9,14 +9,7 @@ lealand is an eza-style listing you can walk around in. You run it as `ll`. It d
 
 Typing two letters quickly runs something: `cl` opens Claude Code where you are, `fi` opens Dolphin. Claude Opus 5.5 wrote it.
 
-```
- lealand   ~ › utils   4 changed           ? help
-▎ cwpl/                2 items  3h ago
-  dotfiles/            4 items  8d ago    M
-  lealand/             8 items  2m ago    M
-  install.sh              1.1k  3d ago       exec
-  id_ed25519               411  1y ago       private
-```
+<img alt="ll in ~/utils, with lealand/ selected" src="logo/screenshot.png" width="600">
 
 The listing is only as wide as its longest name. The last column is empty unless something is unusual about the file for the folder it is in: `exec`, `private` (only you can read it), `read-only` in a folder you can write to, `world-writable`, a broken link, or an owner that is neither you nor the folder's owner. The letter before it is git status. Dotfiles are shown, dimmed, after everything else.
 

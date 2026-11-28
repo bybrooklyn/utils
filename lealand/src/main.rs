@@ -197,7 +197,9 @@ fn run(app: &mut App) -> io::Result<()> {
             app.full = !app.full;
             term = if app.full {
                 execute!(io::stdout(), EnterAlternateScreen)?;
-                Terminal::new(CrosstermBackend::new(io::stdout()))?
+                let mut t = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+                t.clear()?;
+                t
             } else {
                 h = app.height();
                 inline(h)?
@@ -294,7 +296,7 @@ impl App {
         }
         let want = match &self.mode {
             Mode::Browse | Mode::Name { .. } | Mode::Confirm(_) => self.entries.len().max(1),
-            Mode::Help => self.chords.len() + 8,
+            Mode::Help => self.chords.len() + 10,
             Mode::Jump { .. } => self.entries.len().max(8),
             Mode::Pick { .. } => 12,
         };
@@ -761,11 +763,18 @@ impl App {
                 }
             }
             Mode::Help => {
-                left = Line::from(" chords and keys".bold());
+                left = Line::from(vec![
+                    " \u{f06c} ".fg(pal::DIR),
+                    Span::styled("lealand", Style::new().fg(pal::DIR).add_modifier(Modifier::ITALIC)),
+                    "   chords and keys".fg(pal::TEXT).bold(),
+                ]);
                 right = Line::from("any key closes ".fg(pal::DIM));
+                lines.push(Line::from(Span::styled("  chords, typed quickly", Style::new().fg(pal::DIR).add_modifier(Modifier::ITALIC))));
                 for c in &self.chords {
-                    lines.push(Line::from(vec![format!("  {:<8}", c.keys).fg(pal::AMBER), describe(&c.act).into()]));
+                    lines.push(Line::from(vec![format!("    {:<11}", c.keys).fg(pal::AMBER).bold(), describe(&c.act).fg(pal::TEXT)]));
                 }
+                lines.push(Line::default());
+                lines.push(Line::from(Span::styled("  keys", Style::new().fg(pal::DIR).add_modifier(Modifier::ITALIC))));
                 for (k, d) in [
                     ("← →", "parent / open"),
                     ("↑ ↓", "move, with ctrl 5 at a time"),
@@ -774,7 +783,7 @@ impl App {
                     ("/", "jump to any folder: type a bit, tab to go"),
                     ("esc esc", "quit, shell stays where it was"),
                 ] {
-                    lines.push(Line::from(vec![format!("  {k:<10}").fg(pal::LINK), d.into()]));
+                    lines.push(Line::from(vec![format!("    {k:<11}").fg(pal::LINK).bold(), d.fg(pal::TEXT)]));
                 }
             }
             Mode::Jump { q, sel, hits, .. } => {
@@ -844,8 +853,18 @@ impl App {
         f.render_widget(Paragraph::new(right), Rect { x: head.x + head.width.saturating_sub(rw), width: rw.min(head.width), ..head });
         f.render_widget(Paragraph::new(lines), body);
         if let Some(side) = side {
-            let lines = self.preview_lines(side.height as usize);
-            let block = ratatui::widgets::Block::new().borders(ratatui::widgets::Borders::LEFT).border_style(Style::new().fg(pal::DIM));
+            let lines = self.preview_lines(side.height.saturating_sub(2) as usize);
+            let title = self.selected().map(|e| {
+                let what = if e.dir { format!("{}/", e.name) } else { e.name.clone() };
+                Line::from(vec![" ".into(), what.fg(pal::TEXT).bold(), " ".into()])
+            });
+            let mut block = ratatui::widgets::Block::new()
+                .borders(ratatui::widgets::Borders::LEFT | ratatui::widgets::Borders::TOP)
+                .border_type(ratatui::widgets::BorderType::Rounded)
+                .border_style(Style::new().fg(pal::FAINT));
+            if let Some(t) = title {
+                block = block.title(t);
+            }
             f.render_widget(Paragraph::new(lines).block(block), side);
         }
     }
@@ -1033,8 +1052,9 @@ impl App {
                     .iter()
                     .take(n)
                     .map(|c| {
-                        let s = if c.hidden { Style::new().fg(pal::FAINT) } else if c.dir { Style::new().fg(pal::DIR) } else { Style::new() };
-                        Line::from(Span::styled(format!(" {} {}", icon(c), c.name), s))
+                        let s = if c.hidden { Style::new().fg(pal::FAINT) } else if c.dir { Style::new().fg(pal::DIR) } else { Style::new().fg(pal::TEXT) };
+                        let slash = if c.dir { "/" } else { "" };
+                        Line::from(Span::styled(format!(" {} {}{slash}", icon(c), c.name), s))
                     })
                     .collect(),
                 Err(e) => vec![Line::from(format!(" {}", e.kind()).fg(pal::RED))],
@@ -1046,7 +1066,12 @@ impl App {
             if buf.contains(&0) {
                 vec![Line::from(format!(" binary, {}", human(e.size)).fg(pal::DIM))]
             } else {
-                String::from_utf8_lossy(&buf).lines().take(n).map(|l| Line::from(format!(" {}", l.replace('\t', "    ")))).collect()
+                String::from_utf8_lossy(&buf)
+                    .lines()
+                    .take(n)
+                    .enumerate()
+                    .map(|(i, l)| Line::from(vec![format!(" {:>3} ", i + 1).fg(pal::FAINT), l.replace('\t', "    ").fg(pal::TEXT)]))
+                    .collect()
             }
         };
         self.preview = Some((path, lines.clone()));
@@ -1118,11 +1143,28 @@ fn describe(a: &Action) -> String {
         Action::Full => "fullscreen with a preview, on and off".into(),
         Action::OpenWith => "pick the app for this kind of file again (del there forgets it)".into(),
         Action::Mkdir(None) => "make a folder here".into(),
-        Action::Mkdir(Some(c)) => format!("make a folder, cd into it, run {c}"),
+        Action::Mkdir(Some(c)) => format!("make a folder, cd into it and run {}", friendly(c)),
         Action::Trash => "move to the trash (asks first)".into(),
-        Action::Exit(c) => format!("quit, cd here, run {c}"),
-        Action::Spawn(c) => format!("run {c} here"),
+        Action::Exit(c) => format!("quit, cd here and run {}", friendly(c)),
+        Action::Spawn(c) => format!("open {} here", friendly(c)),
     }
+}
+
+/// "dolphin ." reads better as Dolphin; anything unknown is shown as typed.
+fn friendly(cmd: &str) -> String {
+    let first = cmd.split_whitespace().next().unwrap_or("");
+    let name = match first {
+        "claude" => "Claude Code",
+        "dolphin" => "Dolphin",
+        "code" => "VS Code",
+        "ghostty" if cmd.contains("+new-tab") => "a new Ghostty tab",
+        "ghostty" => "Ghostty",
+        "konsole" => "Konsole",
+        "kate" => "Kate",
+        "lazygit" => "lazygit",
+        _ => return format!("`{cmd}`"),
+    };
+    name.into()
 }
 
 fn load_chords() -> (Vec<Chord>, Option<String>) {
