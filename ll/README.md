@@ -25,7 +25,7 @@ The last column is empty unless something is unusual about the file: `exec`, `pr
 
 ## Chords
 
-Each key of a chord has to come within 300 ms of the last one.
+Each key of a chord has to come within 300 ms of the last one. When a chord is also the start of a longer one, like `mk` and `mkcl`, it waits those 300 ms for the next key before it runs.
 
 - **qq** quit and cd to where you are
 - **cl** quit, cd, and run `claude`
@@ -34,6 +34,9 @@ Each key of a chord has to come within 300 ms of the last one.
 - **tt** open a new Ghostty tab here
 - **fu** fullscreen, with a preview of the file or folder under the cursor, and back
 - **op** open the file with a different app
+- **mk** make a folder. Type its name in the top line and press Enter
+- **mkcl** make a folder, cd into it and run `claude`
+- **rm** move the file or folder to the trash, after a y/n
 - **?** list all of this
 
 Add or change chords in `~/.config/ll/chords`, one per line:
@@ -45,7 +48,7 @@ ko    spawn konsole
 code  none
 ```
 
-`spawn` runs a command in the current folder with no terminal, for apps with their own window, and ll stays open. `exit` quits and runs the command in your shell after the cd, so terminal programs go there. `none` removes a chord. A `spawn` command gets the file under the cursor as `$f`. A chord can't be the start of another one (`c` and `cl`), and ll says so in the corner if you try.
+`mkdir` and `mkdir-exit <command>` ask for a folder name, and `trash` asks before moving things to the trash. `spawn` runs a command in the current folder with no terminal, for apps with their own window, and ll stays open. `exit` quits and runs the command in your shell after the cd, so terminal programs go there. `none` removes a chord. A `spawn` command gets the file under the cursor as `$f`.
 
 ## Jumping
 
@@ -53,7 +56,7 @@ code  none
 
 Folders you go to often and recently rank higher. That comes from every `cd` in zsh (a hook in the dotfiles zshrc), every folder you open in ll, and on the first run, the `cd`s in `~/.zsh_history`.
 
-You get 2 seconds after `/` and after the first letter, then 500 ms between letters. Running out cancels. Tab or Enter goes, ↑ ↓ picks another match.
+With nothing typed yet, the list is the folders you go to most, so `/` then Tab takes you to the top one. You get 2 seconds after `/` and after the first letter, then 500 ms between letters. Running out cancels. Tab or Enter goes, ↑ ↓ picks another match.
 
 ## Opening files
 

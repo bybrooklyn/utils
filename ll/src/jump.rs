@@ -180,6 +180,8 @@ impl Index {
         let mut best: HashMap<&Path, f64> = HashMap::new();
         let local: Vec<_> = local.iter().map(|p| named(p.clone())).collect();
         let frec_named: Vec<_> = frec.keys().map(|p| named(p.clone())).collect();
+        // nothing typed: only the places you go
+        let (local, dirs): (&[_], &[_]) = if q.is_empty() { (&[], &[]) } else { (&local, &dirs) };
         for (p, name) in local.iter().chain(&frec_named).chain(dirs.iter()) {
             if best.contains_key(p.as_path()) || p == cwd {
                 continue;

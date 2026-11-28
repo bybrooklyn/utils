@@ -41,6 +41,7 @@ use unicode_width::UnicodeWidthChar;
 const GAP: Duration = Duration::from_millis(300);
 
 /// `keys action [command]`. ~/.config/ll/chords uses the same format and wins; `xx none` removes one.
+/// A chord that starts a longer one (mk, mkcl) fires when no next key comes within GAP.
 const DEFAULT_CHORDS: &str = r#"
 qq    quit
 ?     help
@@ -49,6 +50,9 @@ op    open-with
 cl    exit  claude
 fi    spawn dolphin .
 code  spawn code .
+mk    mkdir
+mkcl  mkdir-exit claude
+rm    trash
 tt    spawn ghostty +new-tab --working-directory="$PWD"
 "#;
 
@@ -60,6 +64,8 @@ enum Action {
     Help,
     Full,
     OpenWith,
+    Mkdir(Option<String>),
+    Trash,
     Exit(String),
     Spawn(String),
 }
@@ -86,6 +92,8 @@ enum Mode {
     Help,
     Jump { q: String, at: Instant, sel: usize, hits: Vec<PathBuf> },
     Pick { file: PathBuf, mime: String, apps: Vec<apps::App>, handles: usize, filter: String, sel: usize },
+    Name { text: String, then: Option<String> },
+    Confirm(PathBuf),
 }
 
 struct App {
@@ -249,7 +257,7 @@ impl App {
 
     fn height(&self) -> u16 {
         let want = match &self.mode {
-            Mode::Browse => self.entries.len().max(1),
+            Mode::Browse | Mode::Name { .. } | Mode::Confirm(_) => self.entries.len().max(1),
             Mode::Help => self.chords.len() + 8,
             Mode::Jump { .. } => self.entries.len().max(8),
             Mode::Pick { .. } => 12,
@@ -271,9 +279,7 @@ impl App {
     }
 
     fn tick(&mut self) {
-        if !self.pending.is_empty() && self.pending_at.elapsed() > GAP {
-            self.pending.clear();
-        }
+        self.expire();
         if self.esc_at.is_some_and(|t| t.elapsed() > GAP) {
             self.esc_at = None;
         }
@@ -295,7 +301,7 @@ impl App {
             let limit = if q.chars().count() <= 1 { 2000 } else { 500 };
             if at.elapsed() > Duration::from_millis(limit) {
                 self.mode = Mode::Browse;
-            } else if hits.is_empty() && !q.is_empty() && self.index.ready.load(std::sync::atomic::Ordering::Relaxed) {
+            } else if hits.is_empty() && self.index.ready.load(std::sync::atomic::Ordering::Relaxed) {
                 let q = q.clone();
                 self.search(&q); // the index finished loading after the last letter
             }
@@ -341,6 +347,26 @@ impl App {
         };
         match &mut self.mode {
             Mode::Help => self.mode = Mode::Browse,
+            Mode::Confirm(path) => {
+                let p = path.clone();
+                self.mode = Mode::Browse;
+                if ch == Some('y') {
+                    self.trash(p);
+                }
+            }
+            Mode::Name { text, then } => match (ch, combo) {
+                (Some(c), _) => text.push(c),
+                (_, key!(backspace)) => {
+                    text.pop();
+                }
+                (_, key!(enter)) => {
+                    let (name, then) = (text.trim().to_string(), then.clone());
+                    self.mode = Mode::Browse;
+                    self.mkdir(&name, then);
+                }
+                (_, key!(esc)) => self.mode = Mode::Browse,
+                _ => {}
+            },
             Mode::Jump { q, at, sel, hits } => {
                 *at = Instant::now();
                 match (ch, combo) {
@@ -394,6 +420,7 @@ impl App {
                 (Some('/'), _) => {
                     self.pending.clear();
                     self.mode = Mode::Jump { q: String::new(), at: Instant::now(), sel: 0, hits: Vec::new() };
+                    self.search(""); // your most-visited folders, before you type anything
                 }
                 (Some(c), _) => self.feed(c),
                 (_, key!(up)) => self.step(-1),
@@ -443,10 +470,18 @@ impl App {
         }
     }
 
-    fn feed(&mut self, c: char) {
-        if self.pending_at.elapsed() > GAP {
-            self.pending.clear();
+    /// A chord left waiting for a longer one fires once the gap has passed.
+    fn expire(&mut self) {
+        if !self.pending.is_empty() && self.pending_at.elapsed() > GAP {
+            let p = std::mem::take(&mut self.pending);
+            if let Some(act) = self.chords.iter().find(|c| c.keys == p).map(|c| c.act.clone()) {
+                self.act(act);
+            }
         }
+    }
+
+    fn feed(&mut self, c: char) {
+        self.expire();
         self.pending_at = Instant::now();
         self.pending.push(c);
         let starts = |p: &str| self.chords.iter().any(|ch| ch.keys.starts_with(p));
@@ -457,7 +492,8 @@ impl App {
                 return;
             }
         }
-        if let Some(ch) = self.chords.iter().find(|ch| ch.keys == self.pending) {
+        let longer = self.chords.iter().any(|ch| ch.keys.len() > self.pending.len() && ch.keys.starts_with(&self.pending));
+        if let Some(ch) = self.chords.iter().find(|ch| ch.keys == self.pending).filter(|_| !longer) {
             let act = ch.act.clone();
             self.pending.clear();
             self.act(act);
@@ -481,6 +517,12 @@ impl App {
                 Some(e) if !e.dir => self.open(e.path.clone(), true),
                 _ => self.flash("op opens a file with another app; this is a folder"),
             },
+            Action::Mkdir(then) => self.mode = Mode::Name { text: String::new(), then },
+            Action::Trash => {
+                if let Some(e) = self.selected() {
+                    self.mode = Mode::Confirm(e.path.clone());
+                }
+            }
             Action::Spawn(cmd) => {
                 let mut c = Command::new("sh");
                 c.arg("-c").arg(&cmd).current_dir(&self.dir).env("PWD", &self.dir);
@@ -492,6 +534,43 @@ impl App {
                 }
             }
         }
+    }
+
+    fn mkdir(&mut self, name: &str, then: Option<String>) {
+        if name.is_empty() {
+            return;
+        }
+        let path = self.dir.join(name);
+        if let Err(e) = fs::create_dir_all(&path) {
+            return self.flash(format!("couldn't make {name}: {}", e.kind()));
+        }
+        match then {
+            Some(cmd) => {
+                jump::record(&path);
+                self.answer = Some(format!("{}\n{cmd}", path.display()));
+                self.done = true;
+            }
+            None => {
+                let first = name.split('/').next().map(String::from);
+                self.go(self.dir.clone(), first, false);
+            }
+        }
+    }
+
+    /// Into the desktop trash (Dolphin can put it back), not deleted.
+    fn trash(&mut self, path: PathBuf) {
+        match Command::new("gio").arg("trash").arg(&path).stdin(Stdio::null()).output() {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => {
+                let why = String::from_utf8_lossy(&o.stderr);
+                let why = why.lines().next().unwrap_or("").rsplit(": ").next().unwrap_or("").to_string();
+                return self.flash(format!("couldn't trash it: {why}"));
+            }
+            Err(e) => return self.flash(format!("couldn't run gio: {}", e.kind())),
+        }
+        let sel = self.sel;
+        self.go(self.dir.clone(), None, false);
+        self.sel = sel.min(self.entries.len().saturating_sub(1));
     }
 
     /// Opens a file with the app picked for its type, or asks which app that should be.
@@ -589,9 +668,8 @@ impl App {
         let left: Line;
         let rows = body.height as usize;
         match &self.mode {
-            Mode::Browse => {
-                left = Line::from(vec![" ".into(), tilde(&self.dir).bold(), git_summary(&self.git)]);
-                right = self.status();
+            Mode::Browse | Mode::Name { .. } | Mode::Confirm(_) => {
+                (left, right) = self.head();
                 if self.sel < self.scroll {
                     self.scroll = self.sel;
                 }
@@ -687,6 +765,20 @@ impl App {
             let lines = self.preview_lines(side.height as usize);
             let block = ratatui::widgets::Block::new().borders(ratatui::widgets::Borders::LEFT).border_style(Style::new().dark_gray());
             f.render_widget(Paragraph::new(lines).block(block), side);
+        }
+    }
+
+    fn head(&self) -> (Line<'static>, Line<'static>) {
+        match &self.mode {
+            Mode::Name { text, then } => {
+                let after = then.as_ref().map_or("enter makes it".into(), |c| format!("enter makes it and runs {c}"));
+                (Line::from(vec![" new folder: ".yellow(), text.clone().bold(), "▏".into()]), Line::from(format!("{after}, esc cancels ").dark_gray()))
+            }
+            Mode::Confirm(p) => {
+                let name = p.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
+                (Line::from(vec![" trash ".red(), name.bold(), "?".into()]), Line::from("y moves it to the trash, any other key keeps it ".dark_gray()))
+            }
+            _ => (Line::from(vec![" ".into(), tilde(&self.dir).bold(), git_summary(&self.git)]), self.status()),
         }
     }
 
@@ -800,6 +892,9 @@ fn describe(a: &Action) -> String {
         Action::Help => "this list".into(),
         Action::Full => "fullscreen with a preview, on and off".into(),
         Action::OpenWith => "open the file with another app (and remember it)".into(),
+        Action::Mkdir(None) => "make a folder here".into(),
+        Action::Mkdir(Some(c)) => format!("make a folder, cd into it, run {c}"),
+        Action::Trash => "move to the trash (asks first)".into(),
         Action::Exit(c) => format!("quit, cd here, run {c}"),
         Action::Spawn(c) => format!("run {c} here"),
     }
@@ -820,6 +915,9 @@ fn load_chords() -> (Vec<Chord>, Option<String>) {
             "help" => Action::Help,
             "full" => Action::Full,
             "open-with" => Action::OpenWith,
+            "mkdir" => Action::Mkdir(None),
+            "mkdir-exit" => Action::Mkdir(Some(rest)),
+            "trash" => Action::Trash,
             "exit" => Action::Exit(rest),
             "spawn" => Action::Spawn(rest),
             "none" => continue,
@@ -828,10 +926,6 @@ fn load_chords() -> (Vec<Chord>, Option<String>) {
                 continue;
             }
         };
-        if let Some(c) = v.iter().find(|c| c.keys.starts_with(keys) || keys.starts_with(&c.keys)) {
-            err = Some(format!("chords: {keys} clashes with {}", c.keys));
-            continue;
-        }
         v.push(Chord { keys: keys.into(), act });
     }
     (v, err)
