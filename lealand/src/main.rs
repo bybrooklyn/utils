@@ -127,6 +127,9 @@ struct App {
     tty_cmd: Option<Command>,
     intro: Option<Instant>,
     cascade: Option<Instant>,
+    outro: Option<Instant>,
+    outro_skipped: bool,
+    animate: bool,
     done: bool,
     answer: Option<String>,
 }
@@ -143,13 +146,14 @@ fn main() {
             eprintln!("lealand: no launch animation from now on (ll --enable-flag brings it back)");
             return;
         }
+        ["--flag"] => return show_flag(),
         ["--enable-flag"] => {
             let _ = fs::remove_file(splash_off_file());
             eprintln!("lealand: the launch animation is back");
             return;
         }
         _ => {
-            eprintln!("ll takes no arguments, apart from --disable-flag and --enable-flag");
+            eprintln!("ll takes no arguments, apart from --flag, --disable-flag and --enable-flag");
             std::process::exit(2);
         }
     }
@@ -177,6 +181,32 @@ fn main() {
     }
 }
 
+/// `ll --flag`: the wordmark, wiped in row by row, then back to the prompt. On stderr, because
+/// stdout is where the zsh function looks for a folder to cd to.
+fn show_flag() {
+    let mut err = io::stderr().lock();
+    let _ = writeln!(err);
+    for row in logo::LOGO {
+        let mut line = String::from("  ");
+        for &(c, fg, bg) in row.iter() {
+            if c == ' ' {
+                line += "\x1b[0m ";
+                continue;
+            }
+            line += &format!("\x1b[38;2;{};{};{}m", fg >> 16, (fg >> 8) & 255, fg & 255);
+            line += &match bg {
+                Some(b) => format!("\x1b[48;2;{};{};{}m", b >> 16, (b >> 8) & 255, b & 255),
+                None => "\x1b[49m".into(),
+            };
+            line.push(c);
+        }
+        let _ = writeln!(err, "{line}\x1b[0m");
+        let _ = err.flush();
+        thread::sleep(Duration::from_millis(16));
+    }
+    let _ = writeln!(err, "\n  \x1b[38;2;158;211;138m\u{f06c} \x1b[3mlealand\x1b[0m \x1b[38;2;134;148;130m{}  ·  run it as ll\x1b[0m\n", env!("CARGO_PKG_VERSION"));
+}
+
 fn inline(h: u16) -> io::Result<Term> {
     Terminal::with_options(CrosstermBackend::new(io::stdout()), TerminalOptions { viewport: Viewport::Inline(h) })
 }
@@ -193,7 +223,7 @@ fn erase(term: &mut Term, full: bool) -> io::Result<()> {
 fn run(app: &mut App) -> io::Result<()> {
     let mut h = app.height();
     let mut term = inline(h)?;
-    while !app.done {
+    while !app.done || app.outro.is_some_and(|t| t.elapsed().as_millis() < OUTRO_END) {
         if app.toggle_full {
             app.toggle_full = false;
             erase(&mut term, app.full)?;
@@ -235,11 +265,19 @@ fn run(app: &mut App) -> io::Result<()> {
         if event::poll(wait)? {
             if let Event::Key(k) = event::read()? {
                 if k.kind == KeyEventKind::Press {
-                    app.key(k);
+                    if app.outro.is_some() {
+                        app.outro = None; // a key skips the goodbye
+                    } else {
+                        app.key(k);
+                    }
                 }
             }
         }
         app.tick();
+        if app.done && app.outro.is_none() && app.animate && !app.outro_skipped {
+            app.outro = Some(Instant::now());
+            app.outro_skipped = true; // only once
+        }
     }
     erase(&mut term, app.full)?;
     // push everything above into scrollback, so the shell's next prompt starts at the top
@@ -282,12 +320,15 @@ impl App {
             tty_cmd: None,
             intro: None,
             cascade: None,
+            outro: None,
+            outro_skipped: false,
+            animate: !splash_off_file().exists(),
             done: false,
             answer: None,
         };
         app.git_rx = Some(git_status(dir));
         let (cols, rows) = terminal::size().unwrap_or((0, 0));
-        if !splash_off_file().exists() && cols as usize >= logo::LOGO.iter().map(|r| r.len()).max().unwrap_or(0) + 2 && rows >= app.intro_height() + 2 {
+        if app.animate && cols as usize >= logo::LOGO.iter().map(|r| r.len()).max().unwrap_or(0) + 2 && rows >= app.intro_height() + 2 {
             app.intro = Some(Instant::now());
         }
         app
@@ -318,6 +359,7 @@ impl App {
 
     fn busy(&self) -> bool {
         self.intro.is_some()
+            || self.outro.is_some()
             || self.cascade.is_some()
             || !self.pending.is_empty()
             || self.esc_at.is_some()
@@ -756,6 +798,13 @@ impl App {
         if let Some(t) = self.intro {
             return self.draw_intro(f, t.elapsed().as_millis());
         }
+        self.draw_main(f);
+        if let Some(t) = self.outro {
+            leaves(f, t.elapsed().as_millis());
+        }
+    }
+
+    fn draw_main(&mut self, f: &mut Frame) {
         let area = f.area();
         let (main, side) = if self.full && area.width >= 70 {
             let w = area.width * 11 / 20;
@@ -1185,6 +1234,8 @@ const DISSOLVE_AT: u128 = 760;
 const INTRO_END: u128 = 1060;
 const ROW_STEP: u128 = 14;
 const LOG_LINES: usize = 5;
+/// Goodbye: the view falls apart into leaves for this long.
+const OUTRO_END: u128 = 420;
 /// Rows around the list: a blank line, the header, the rule, then a blank line and the footer.
 const CHROME: u16 = 5;
 /// Columns around the name in a row: margin, marker, gap, icon, 2, then 4 before the size (9),
@@ -1203,6 +1254,43 @@ fn rgb(v: u32) -> Color {
 fn noise(x: usize, y: usize) -> f64 {
     let h = (x as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (y as u64).wrapping_mul(0xc2b2_ae3d_27d4_eb4f);
     (h >> 40) as f64 / (1u64 << 24) as f64
+}
+
+/// The goodbye: each character drops out at its own moment, and about a third of them turn into
+/// leaves that sway down and fade.
+fn leaves(f: &mut Frame, t: u128) {
+    let area = f.area();
+    let buf = f.buffer_mut();
+    let old = buf.clone();
+    buf.reset();
+    let greens = [pal::DIR, pal::LEAF, Color::Rgb(0x6f, 0xb6, 0x5a), Color::Rgb(0x3f, 0x8a, 0x46)];
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let cell = &old[(x, y)];
+            if cell.symbol() == " " && cell.bg == Color::Reset {
+                continue;
+            }
+            let n = noise(x as usize, y as usize + 7);
+            let start = (n * 170.0) as u128;
+            if t < start {
+                buf[(x, y)] = cell.clone();
+                continue;
+            }
+            if cell.symbol() == " " || noise(x as usize + 3, y as usize) > 0.33 {
+                continue;
+            }
+            let age = t - start;
+            let fall = y as u128 + age / 45;
+            if fall >= area.bottom() as u128 {
+                continue;
+            }
+            let sway = ((age as f64 / 90.0 + n * 6.0).sin() * 1.3).round() as i32;
+            let nx = (x as i32 + sway).clamp(area.left() as i32, area.right() as i32 - 1) as u16;
+            let color = if age > 200 { pal::FAINT } else { greens[(n * 40.0) as usize % 4] };
+            let glyph = ["\u{f06c}", "\u{f06c}", "\u{f18c}", "‚"][(n * 97.0) as usize % 4];
+            buf[(nx, fall as u16)].set_symbol(glyph).set_style(Style::new().fg(color));
+        }
+    }
 }
 
 fn thousands(n: usize) -> String {
