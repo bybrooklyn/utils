@@ -269,15 +269,14 @@ fn run(app: &mut App) -> io::Result<()> {
             }
             terminal::enable_raw_mode()?;
             app.refresh();
-            if std::mem::take(&mut app.tty_wait) {
-                if let Ok(st) = status {
+            if std::mem::take(&mut app.tty_wait)
+                && let Ok(st) = status {
                     let code = st.code().map_or("a signal".to_string(), |c| c.to_string());
                     print!("\r\n\x1b[38;2;134;148;130m  exited with {code}  ·  any key goes back to lealand\x1b[0m");
                     io::stdout().flush()?;
                     while !matches!(event::read()?, Event::Key(k) if k.kind == KeyEventKind::Press) {}
                     print!("\r\n");
                 }
-            }
             execute!(io::stdout(), EnableMouseCapture)?;
             term = if app.full {
                 execute!(io::stdout(), EnterAlternateScreen)?;
@@ -977,15 +976,14 @@ impl App {
     /// Opens a file with the app picked for its type, or asks which app that should be.
     fn open(&mut self, file: PathBuf, ask: bool) {
         let mime = apps::mime(&file);
-        if !ask {
-            if let Some(a) = self.cfg.openers.get(&mime).and_then(|p| apps::parse(p)) {
+        if !ask
+            && let Some(a) = self.cfg.openers.get(&mime).and_then(|p| apps::parse(p)) {
                 self.launch(&a, &file);
                 if self.msg.is_none() {
                     self.flash(format!("opened in {}, op picks another", a.name));
                 }
                 return;
             }
-        }
         let (apps, handles) = apps::list(&mime);
         if apps.is_empty() {
             return self.flash("no apps found");
@@ -1579,11 +1577,10 @@ impl App {
     fn preview_lines(&mut self, n: usize, width: u16) -> Vec<Line<'static>> {
         let Some(e) = self.selected() else { return Vec::new() };
         let path = e.path.clone();
-        if let Some((p, lines)) = &self.preview {
-            if *p == path {
+        if let Some((p, lines)) = &self.preview
+            && *p == path {
                 return lines.clone();
             }
-        }
         let lines: Vec<Line<'static>> = if e.dir {
             match read_entries(&path) {
                 Ok(v) if v.is_empty() => vec![Line::from(" empty".fg(pal::DIM))],
@@ -1733,7 +1730,7 @@ fn thousands(n: usize) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);

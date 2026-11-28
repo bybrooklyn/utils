@@ -157,11 +157,10 @@ fn seed(file: &Path) {
             None if arg.starts_with('/') => arg.into(),
             None => home().join(arg),
         };
-        if let Ok(p) = fs::canonicalize(p).map(PathBuf::from) {
-            if p.is_dir() {
+        if let Ok(p) = fs::canonicalize(p)
+            && p.is_dir() {
                 out += &format!("{ts} {}\n", p.display());
             }
-        }
     }
     let _ = fs::create_dir_all(file.parent().unwrap());
     let _ = fs::write(file, out);
