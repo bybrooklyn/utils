@@ -12,7 +12,7 @@ use ratatui::{
     backend::CrosstermBackend,
     crossterm::{
         cursor,
-        event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+        event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind},
         execute,
         terminal::{self, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
     },
@@ -129,6 +129,8 @@ struct App {
     cascade: Option<Instant>,
     outro: Option<Instant>,
     outro_skipped: bool,
+    body_top: u16,
+    click_at: Option<Instant>,
     animate: bool,
     done: bool,
     answer: Option<String>,
@@ -164,12 +166,13 @@ fn main() {
     }
     std::panic::set_hook(Box::new(|info| {
         let _ = terminal::disable_raw_mode();
-        let _ = execute!(io::stdout(), cursor::Show);
+        let _ = execute!(io::stdout(), DisableMouseCapture, cursor::Show);
         eprintln!("ll crashed: {info}");
     }));
     let dir = env::current_dir().unwrap_or_else(|_| jump::home());
     let mut app = App::new(dir);
-    let result = terminal::enable_raw_mode().and_then(|_| run(&mut app));
+    let result = terminal::enable_raw_mode().and_then(|_| execute!(io::stdout(), EnableMouseCapture)).and_then(|_| run(&mut app));
+    let _ = execute!(io::stdout(), DisableMouseCapture);
     let _ = terminal::disable_raw_mode();
     let _ = execute!(io::stdout(), cursor::Show);
     if let Err(e) = result {
@@ -240,6 +243,7 @@ fn run(app: &mut App) -> io::Result<()> {
         }
         if let Some(mut cmd) = app.tty_cmd.take() {
             erase(&mut term, app.full)?;
+            execute!(io::stdout(), DisableMouseCapture)?;
             terminal::disable_raw_mode()?;
             execute!(io::stdout(), cursor::Show)?;
             let tty = || File::options().write(true).open("/dev/tty").map_or(Stdio::inherit(), Stdio::from);
@@ -247,6 +251,7 @@ fn run(app: &mut App) -> io::Result<()> {
                 app.flash(format!("couldn't run it: {e}"));
             }
             terminal::enable_raw_mode()?;
+            execute!(io::stdout(), EnableMouseCapture)?;
             term = if app.full {
                 execute!(io::stdout(), EnterAlternateScreen)?;
                 Terminal::new(CrosstermBackend::new(io::stdout()))?
@@ -263,14 +268,16 @@ fn run(app: &mut App) -> io::Result<()> {
         term.draw(|f| app.draw(f))?;
         let wait = if app.busy() { Duration::from_millis(30) } else { Duration::from_secs(1) };
         if event::poll(wait)? {
-            if let Event::Key(k) = event::read()? {
-                if k.kind == KeyEventKind::Press {
+            match event::read()? {
+                Event::Key(k) if k.kind == KeyEventKind::Press => {
                     if app.outro.is_some() {
                         app.outro = None; // a key skips the goodbye
                     } else {
                         app.key(k);
                     }
                 }
+                Event::Mouse(m) if app.outro.is_none() => app.mouse(m),
+                _ => {}
             }
         }
         app.tick();
@@ -322,6 +329,8 @@ impl App {
             cascade: None,
             outro: None,
             outro_skipped: false,
+            body_top: 0,
+            click_at: None,
             animate: !splash_off_file().exists(),
             done: false,
             answer: None,
@@ -547,11 +556,7 @@ impl App {
                         self.pending.clear();
                     }
                 }
-                (_, key!(right) | key!(enter)) => match self.selected() {
-                    Some(e) if e.dir => self.go(e.path.clone(), None, true),
-                    Some(e) => self.open(e.path.clone(), false),
-                    None => {}
-                },
+                (_, key!(right) | key!(enter)) => self.enter(),
                 (_, key!(left)) => {
                     if let Some(parent) = self.dir.parent().map(Path::to_path_buf) {
                         let name = self.dir.file_name().map(|n| n.to_string_lossy().into_owned());
@@ -574,6 +579,44 @@ impl App {
                 }
                 _ => {}
             },
+        }
+    }
+
+    /// Opens what the cursor is on: into a folder, or a file with its app.
+    fn enter(&mut self) {
+        match self.selected() {
+            Some(e) if e.dir => self.go(e.path.clone(), None, true),
+            Some(e) => self.open(e.path.clone(), false),
+            None => {}
+        }
+    }
+
+    /// Click picks a row, a second click on it within 400 ms opens it, the wheel moves.
+    fn mouse(&mut self, m: MouseEvent) {
+        if !matches!(m.kind, MouseEventKind::Moved | MouseEventKind::Drag(_)) {
+            self.intro = None;
+            self.cascade = None;
+        }
+        if !matches!(self.mode, Mode::Browse) {
+            return;
+        }
+        match m.kind {
+            MouseEventKind::ScrollUp => self.step(-3),
+            MouseEventKind::ScrollDown => self.step(3),
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some(row) = m.row.checked_sub(self.body_top).map(usize::from).filter(|&r| r < self.rows) else { return };
+                let i = self.scroll + row;
+                if i >= self.entries.len() {
+                    return;
+                }
+                let again = i == self.sel && self.click_at.is_some_and(|t| t.elapsed() < Duration::from_millis(400));
+                self.sel = i;
+                self.click_at = if again { None } else { Some(Instant::now()) };
+                if again {
+                    self.enter();
+                }
+            }
+            _ => {}
         }
     }
 
@@ -823,6 +866,7 @@ impl App {
         let rule = Rect { x: main.x + 2, y: main.y + 2, width: main.width.saturating_sub(4), height: 1 };
         let body = Rect { y: main.y + 3, height: main.height.saturating_sub(CHROME), width: main.width.saturating_sub(2), ..main };
         let foot = Rect { y: main.y + main.height.saturating_sub(1), height: 1, ..main };
+        self.body_top = body.y;
         let mut lines: Vec<Line> = Vec::new();
         let right: Line;
         let left: Line;
