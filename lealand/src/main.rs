@@ -1,4 +1,4 @@
-//! ll: an eza-style listing you can walk around in, drawn inline under the prompt.
+//! lealand (the `ll` command): an eza-style listing you can walk around in, drawn inline under the prompt.
 //! It prints where you ended up (and maybe a command) on stdout; the zsh `ll` function cds and runs it.
 
 mod apps;
@@ -40,7 +40,7 @@ use unicode_width::UnicodeWidthChar;
 /// Keys of a chord must come within this long of each other.
 const GAP: Duration = Duration::from_millis(300);
 
-/// `keys action [command]`. ~/.config/ll/chords uses the same format and wins; `xx none` removes one.
+/// `keys action [command]`. ~/.config/lealand/chords uses the same format and wins; `xx none` removes one.
 /// A chord that starts a longer one (mk, mkcl) fires when no next key comes within GAP.
 const DEFAULT_CHORDS: &str = r#"
 qq    quit
@@ -937,7 +937,7 @@ fn describe(a: &Action) -> String {
 }
 
 fn load_chords() -> (Vec<Chord>, Option<String>) {
-    let file = env::var_os("XDG_CONFIG_HOME").map_or_else(|| jump::home().join(".config"), PathBuf::from).join("ll/chords");
+    let file = env::var_os("XDG_CONFIG_HOME").map_or_else(|| jump::home().join(".config"), PathBuf::from).join("lealand/chords");
     let user = fs::read_to_string(file).unwrap_or_default();
     let (mut v, mut err): (Vec<Chord>, _) = (Vec::new(), None);
     for line in DEFAULT_CHORDS.lines().chain(user.lines()) {

@@ -1,9 +1,13 @@
 [package]
-name = "ll"
-version = "0.1.0"
+name = "lealand"
+version = "0.2.0"
 edition = "2024"
-description = "An inline directory browser with typed chords"
+description = "lealand: an inline directory browser with typed chords, run as ll"
 license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "ll"
+path = "src/main.rs"
 
 [dependencies]
 ratatui = "0.30"

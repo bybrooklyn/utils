@@ -1,4 +1,4 @@
-# ll
+# lealand
 
 An eza-style listing you can walk around in. It draws under the prompt instead of taking over the terminal, and when you quit, your shell is in the folder you ended up in.
 
@@ -39,7 +39,7 @@ Each key of a chord has to come within 300 ms of the last one. When a chord is a
 - **rm** move the file or folder to the trash, after a y/n
 - **?** list all of this
 
-Add or change chords in `~/.config/ll/chords`, one per line:
+Add or change chords in `~/.config/lealand/chords`, one per line:
 
 ```
 gi    exit  lazygit
@@ -65,7 +65,7 @@ The first time you open a type of file, ll lists the apps that handle it, with K
 ## Install
 
 ```sh
-bash ~/utils/ll/install.sh
+bash ~/utils/lealand/install.sh
 ```
 
 It needs cargo, and a Nerd Font for the icons. The `ll` zsh function does the cd, so it has to be in `~/.zshrc`. The dotfiles zshrc has it, and the installer prints the block if yours doesn't.
@@ -74,9 +74,9 @@ It needs cargo, and a Nerd Font for the icons. The `ll` zsh function does the cd
 
 | file | what |
 |---|---|
-| `~/.config/ll/chords` | your chords |
-| `~/.config/ll/apps` | the app picked for each MIME type |
-| `~/.local/share/ll/visits` | where you've been, for ranking `/` |
-| `~/.cache/ll/dirs` | the folder index, rebuilt in the background when it's over an hour old |
+| `~/.config/lealand/chords` | your chords |
+| `~/.config/lealand/apps` | the app picked for each MIME type |
+| `~/.local/share/lealand/visits` | where you've been, for ranking `/` |
+| `~/.cache/lealand/dirs` | the folder index, rebuilt in the background when it's over an hour old |
 
-To remove it: `cargo uninstall ll`, delete those four, and take the block starting `# ll (~/utils/ll)` out of the zshrc.
+To remove it: `cargo uninstall lealand`, delete those four, and take the block starting `# lealand (~/utils/lealand)` out of the zshrc.

@@ -27,7 +27,7 @@ pub fn mime(file: &Path) -> String {
 }
 
 fn saved_file() -> PathBuf {
-    env::var_os("XDG_CONFIG_HOME").map_or_else(|| super::jump::home().join(".config"), PathBuf::from).join("ll/apps")
+    env::var_os("XDG_CONFIG_HOME").map_or_else(|| super::jump::home().join(".config"), PathBuf::from).join("lealand/apps")
 }
 
 /// The app picked for this type before, if it's still installed.

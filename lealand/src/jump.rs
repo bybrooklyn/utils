@@ -30,7 +30,7 @@ pub fn home() -> PathBuf {
 }
 
 fn xdg(var: &str, fallback: &str) -> PathBuf {
-    env::var_os(var).map_or_else(|| home().join(fallback), PathBuf::from).join("ll")
+    env::var_os(var).map_or_else(|| home().join(fallback), PathBuf::from).join("lealand")
 }
 
 fn now() -> u64 {

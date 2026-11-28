@@ -60,7 +60,7 @@ export PATH=/home/brook/.opencode/bin:$PATH
 export ANDROID_HOME="$HOME/Android/Sdk"
 export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/29.0.14206865"
 
-# ll (~/utils/ll): walk around with the arrows, qq to cd where you ended up.
+# lealand (~/utils/lealand), the ll command: walk around with the arrows, qq to cd where you ended up.
 # The binary prints the folder and maybe a command; this does the cd and runs it.
 unalias ll 2>/dev/null
 ll() {
@@ -70,7 +70,7 @@ ll() {
     cd -- "${out%%$'\n'*}" || return
     [[ $out == *$'\n'* ]] && eval "${out#*$'\n'}"
 }
-# every cd counts towards ll's / jump
+# every cd counts towards lealand's / jump
 zmodload zsh/datetime
-_ll_visit() { { print -r -- "$EPOCHSECONDS $PWD" >>| ${XDG_DATA_HOME:-$HOME/.local/share}/ll/visits } 2>/dev/null }
+_ll_visit() { { print -r -- "$EPOCHSECONDS $PWD" >>| ${XDG_DATA_HOME:-$HOME/.local/share}/lealand/visits } 2>/dev/null }
 autoload -Uz add-zsh-hook && add-zsh-hook chpwd _ll_visit
