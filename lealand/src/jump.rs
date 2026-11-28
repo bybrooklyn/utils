@@ -171,6 +171,11 @@ fn seed(file: &Path) {
 }
 
 impl Index {
+    /// Places you've been, and folders in the index.
+    pub fn counts(&self) -> (usize, usize) {
+        (self.frec.read().unwrap().len(), self.dirs.read().unwrap().len())
+    }
+
     /// Best directories for `q`, best first. `local` are the folders in the current directory, which
     /// count even when they're hidden or ignored.
     pub fn search(&self, q: &str, cwd: &Path, local: &[PathBuf]) -> Vec<PathBuf> {

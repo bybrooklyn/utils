@@ -3,6 +3,7 @@
 
 mod apps;
 mod jump;
+mod logo;
 
 use crokey::{KeyCombination, key};
 use ratatui::{
@@ -120,14 +121,33 @@ struct App {
     uid: u32,
     users: HashMap<u32, String>,
     tty_cmd: Option<Command>,
+    intro: Option<Instant>,
+    cascade: Option<Instant>,
     done: bool,
     answer: Option<String>,
 }
 
 fn main() {
-    if env::args_os().len() > 1 {
-        eprintln!("ll takes no arguments: run it, walk, and qq to land there");
-        std::process::exit(2);
+    // stdout is the zsh function's cd target, so everything said here goes to stderr
+    let args: Vec<String> = env::args().skip(1).collect();
+    match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+        [] => {}
+        ["--disable-flag"] => {
+            let f = splash_off_file();
+            let _ = fs::create_dir_all(f.parent().unwrap());
+            let _ = fs::write(&f, "");
+            eprintln!("lealand: no launch animation from now on (ll --enable-flag brings it back)");
+            return;
+        }
+        ["--enable-flag"] => {
+            let _ = fs::remove_file(splash_off_file());
+            eprintln!("lealand: the launch animation is back");
+            return;
+        }
+        _ => {
+            eprintln!("ll takes no arguments, apart from --disable-flag and --enable-flag");
+            std::process::exit(2);
+        }
     }
     // stdout is the zsh function's $(...); keep it for the answer and point fd 1 at the terminal
     let answer_fd = unsafe { libc::dup(1) };
@@ -245,11 +265,21 @@ impl App {
             uid: unsafe { libc::getuid() },
             users: HashMap::new(),
             tty_cmd: None,
+            intro: None,
+            cascade: None,
             done: false,
             answer: None,
         };
         app.git_rx = Some(git_status(dir));
+        let (cols, rows) = terminal::size().unwrap_or((0, 0));
+        if !splash_off_file().exists() && cols as usize >= 76 && rows >= app.intro_height() + 2 {
+            app.intro = Some(Instant::now());
+        }
         app
+    }
+
+    fn intro_height(&self) -> u16 {
+        (LOG_LINES + 1 + logo::LOGO.len()) as u16
     }
 
     fn max_height(&self) -> u16 {
@@ -258,6 +288,9 @@ impl App {
     }
 
     fn height(&self) -> u16 {
+        if self.intro.is_some() {
+            return self.intro_height();
+        }
         let want = match &self.mode {
             Mode::Browse | Mode::Name { .. } | Mode::Confirm(_) => self.entries.len().max(1),
             Mode::Help => self.chords.len() + 8,
@@ -269,7 +302,9 @@ impl App {
     }
 
     fn busy(&self) -> bool {
-        !self.pending.is_empty()
+        self.intro.is_some()
+            || self.cascade.is_some()
+            || !self.pending.is_empty()
             || self.esc_at.is_some()
             || self.msg.is_some()
             || self.git_rx.is_some()
@@ -281,6 +316,13 @@ impl App {
     }
 
     fn tick(&mut self) {
+        if self.intro.is_some_and(|t| t.elapsed().as_millis() > INTRO_END) {
+            self.intro = None;
+            self.cascade = Some(Instant::now());
+        }
+        if self.cascade.is_some_and(|t| t.elapsed().as_millis() > ROW_STEP * self.rows as u128 + 50) {
+            self.cascade = None;
+        }
         self.expire();
         if self.esc_at.is_some_and(|t| t.elapsed() > GAP) {
             self.esc_at = None;
@@ -339,6 +381,9 @@ impl App {
     }
 
     fn key(&mut self, k: KeyEvent) {
+        // any key skips the launch animation, and still does what it does
+        self.intro = None;
+        self.cascade = None;
         let combo = KeyCombination::from(k);
         if combo == key!(ctrl - c) {
             self.done = true;
@@ -661,6 +706,9 @@ impl App {
     // ---------- drawing ----------
 
     fn draw(&mut self, f: &mut Frame) {
+        if let Some(t) = self.intro {
+            return self.draw_intro(f, t.elapsed().as_millis());
+        }
         let area = f.area();
         let (main, side) = if self.full && area.width >= 70 {
             let w = area.width * 11 / 20;
@@ -668,7 +716,7 @@ impl App {
         } else {
             // inline, the view is only as wide as its rows
             let want = match self.mode {
-                Mode::Browse => self.row_width().max(48),
+                Mode::Browse => self.row_width().max(56),
                 Mode::Name { .. } | Mode::Confirm(_) => self.row_width().max(72),
                 _ => area.width as usize,
             };
@@ -691,19 +739,20 @@ impl App {
                 }
                 self.rows = rows.max(1);
                 if self.entries.is_empty() {
-                    lines.push(Line::from("   empty".dark_gray()));
+                    lines.push(Line::from("   empty".fg(pal::DIM)));
                 }
                 let (names, flags) = self.widths();
                 let name_w = names.min((body.width as usize).saturating_sub(26 + flags)).max(8);
-                for i in self.scroll..(self.scroll + rows).min(self.entries.len()) {
+                let shown = self.cascade.map_or(rows, |t| (t.elapsed().as_millis() / ROW_STEP) as usize + 1);
+                for i in self.scroll..(self.scroll + rows.min(shown)).min(self.entries.len()) {
                     lines.push(self.row(i, name_w));
                 }
             }
             Mode::Help => {
                 left = Line::from(" chords and keys".bold());
-                right = Line::from("any key closes ".dark_gray());
+                right = Line::from("any key closes ".fg(pal::DIM));
                 for c in &self.chords {
-                    lines.push(Line::from(vec![format!("  {:<8}", c.keys).yellow(), describe(&c.act).into()]));
+                    lines.push(Line::from(vec![format!("  {:<8}", c.keys).fg(pal::AMBER), describe(&c.act).into()]));
                 }
                 for (k, d) in [
                     ("← →", "parent / open"),
@@ -713,7 +762,7 @@ impl App {
                     ("/", "jump to any folder: type a bit, tab to go"),
                     ("esc esc", "quit, shell stays where it was"),
                 ] {
-                    lines.push(Line::from(vec![format!("  {k:<10}").cyan(), d.into()]));
+                    lines.push(Line::from(vec![format!("  {k:<10}").fg(pal::LINK), d.into()]));
                 }
             }
             Mode::Jump { q, sel, hits, .. } => {
@@ -724,19 +773,20 @@ impl App {
                     _ if ghost.is_empty() => String::new(),
                     _ => format!("  → {ghost}"),
                 };
-                left = Line::from(vec![" /".yellow().bold(), q.clone().bold(), rest.dark_gray()]);
-                right = Line::from(top.map(|p| tilde(p)).unwrap_or_default().dark_gray());
+                left = Line::from(vec![" /".fg(pal::AMBER).bold(), q.clone().bold(), rest.fg(pal::DIM)]);
+                right = Line::from(top.map(|p| tilde(p)).unwrap_or_default().fg(pal::DIM));
                 if hits.is_empty() {
                     let ready = self.index.ready.load(std::sync::atomic::Ordering::Relaxed);
                     let say = if q.is_empty() { "type part of a folder name" } else if ready { "no match" } else { "still indexing ~" };
-                    lines.push(Line::from(format!("   {say}").dark_gray()));
+                    lines.push(Line::from(format!("   {say}").fg(pal::DIM)));
                 }
                 for (i, p) in hits.iter().enumerate().take(rows) {
                     let name = p.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
                     let parent = p.parent().map(tilde).unwrap_or_default();
-                    let mut l = Line::from(vec!["  \u{f07b} ".blue(), name.blue().bold(), format!("  {parent}").dark_gray()]);
+                    let mark = if i == *sel { "▎" } else { " " };
+                    let mut l = Line::from(vec![mark.fg(pal::DIR), " \u{f07b} ".fg(pal::DIR), name.fg(pal::DIR).bold(), format!("  {parent}").fg(pal::DIM)]);
                     if i == *sel {
-                        l = l.style(Style::new().bg(SEL_BG));
+                        l = l.style(Style::new().bg(pal::SEL));
                     }
                     lines.push(l);
                 }
@@ -744,7 +794,7 @@ impl App {
             Mode::Pick { file, mime, apps, handles, filter, sel } => {
                 let name = file.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
                 left = Line::from(vec![" open ".into(), name.bold(), " with".into()]);
-                right = Line::from(vec![filter.clone().yellow(), format!("  {mime} ").dark_gray()]);
+                right = Line::from(vec![filter.clone().fg(pal::AMBER), format!("  {mime} ").fg(pal::DIM)]);
                 let shown = picked(apps, filter);
                 let start = sel.saturating_sub(rows.saturating_sub(1));
                 for (row, &i) in shown.iter().enumerate().skip(start).take(rows) {
@@ -752,23 +802,23 @@ impl App {
                     let fits = i < *handles;
                     let mut spans = vec![
                         "  ".into(),
-                        if fits { a.name.clone().bold() } else { a.name.clone().dark_gray() },
-                        format!("  {}", a.generic).dark_gray(),
+                        if fits { a.name.clone().bold() } else { a.name.clone().fg(pal::DIM) },
+                        format!("  {}", a.generic).fg(pal::DIM),
                     ];
                     if i == 0 && fits && filter.is_empty() {
-                        spans.push("  default".green());
+                        spans.push("  default".fg(pal::DIR));
                     }
                     if a.terminal {
-                        spans.push("  terminal".cyan());
+                        spans.push("  terminal".fg(pal::LINK));
                     }
                     let mut l = Line::from(spans);
                     if row == *sel {
-                        l = l.style(Style::new().bg(SEL_BG));
+                        l = l.style(Style::new().bg(pal::SEL));
                     }
                     lines.push(l);
                 }
                 if shown.is_empty() {
-                    lines.push(Line::from("   nothing matches".dark_gray()));
+                    lines.push(Line::from("   nothing matches".fg(pal::DIM)));
                 }
             }
         }
@@ -778,7 +828,7 @@ impl App {
         f.render_widget(Paragraph::new(lines), body);
         if let Some(side) = side {
             let lines = self.preview_lines(side.height as usize);
-            let block = ratatui::widgets::Block::new().borders(ratatui::widgets::Borders::LEFT).border_style(Style::new().dark_gray());
+            let block = ratatui::widgets::Block::new().borders(ratatui::widgets::Borders::LEFT).border_style(Style::new().fg(pal::DIM));
             f.render_widget(Paragraph::new(lines).block(block), side);
         }
     }
@@ -787,28 +837,94 @@ impl App {
         match &self.mode {
             Mode::Name { text, then } => {
                 let after = then.as_ref().map_or("enter makes it".into(), |c| format!("enter makes it and runs {c}"));
-                (Line::from(vec![" new folder: ".yellow(), text.clone().bold(), "▏".into()]), Line::from(format!("{after}, esc cancels ").dark_gray()))
+                (Line::from(vec![" new folder: ".fg(pal::AMBER), text.clone().bold(), "▏".into()]), Line::from(format!("{after}, esc cancels ").fg(pal::DIM)))
             }
             Mode::Confirm(p) => {
                 let name = p.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
-                (Line::from(vec![" trash ".red(), name.bold(), "?".into()]), Line::from("y moves it to the trash, any other key keeps it ".dark_gray()))
+                (Line::from(vec![" trash ".fg(pal::RED), name.bold(), "?".into()]), Line::from("y moves it to the trash, any other key keeps it ".fg(pal::DIM)))
             }
-            _ => (Line::from(vec![" ".into(), tilde(&self.dir).bold(), git_summary(&self.git)]), self.status()),
+            _ => (self.crumbs(), self.status()),
         }
+    }
+
+    /// Real log lines, then the willow wipes in from the top and dissolves into the listing.
+    fn draw_intro(&mut self, f: &mut Frame, t: u128) {
+        let ready = self.index.ready.load(std::sync::atomic::Ordering::Relaxed);
+        let (places, dirs) = self.index.counts();
+        let logs = [
+            format!("lealand {}", env!("CARGO_PKG_VERSION")),
+            format!("read {}, {} entries", tilde(&self.dir), self.entries.len()),
+            format!("{} chords", self.chords.len()),
+            if places > 0 { format!("{} places you've been", thousands(places)) } else { "no places yet".into() },
+            if ready { format!("{} folders indexed", thousands(dirs)) } else { "indexing ~ in the background".into() },
+        ];
+        let gone = if t > DISSOLVE_AT { (t - DISSOLVE_AT) as f64 / (INTRO_END - DISSOLVE_AT) as f64 } else { 0.0 };
+        let mut lines: Vec<Line> = Vec::new();
+        for (i, l) in logs.iter().enumerate().take((t / 18) as usize + 1) {
+            if noise(i, 99) < gone {
+                lines.push(Line::default());
+                continue;
+            }
+            let (mark, color) = if i == 0 { (" \u{f06c} ", pal::TEXT) } else { ("  ✓ ", pal::DIM) };
+            lines.push(Line::from(vec![mark.fg(pal::DIR), Span::styled(l.clone(), Style::new().fg(color))]));
+        }
+        lines.resize(LOG_LINES + 1, Line::default());
+        if t >= LOGO_AT {
+            let rows = ((t - LOGO_AT) / 10) as usize + 1;
+            for (y, row) in logo::LOGO.iter().enumerate().take(rows) {
+                let mut spans = vec![Span::raw("  ")];
+                for (x, &(c, fg, bg)) in row.iter().enumerate() {
+                    if c == ' ' || noise(x, y) < gone {
+                        spans.push(Span::raw(" "));
+                    } else {
+                        let mut st = Style::new().fg(rgb(fg));
+                        if let Some(b) = bg {
+                            st = st.bg(rgb(b));
+                        }
+                        spans.push(Span::styled(c.to_string(), st));
+                    }
+                }
+                lines.push(Line::from(spans));
+            }
+        }
+        f.render_widget(Paragraph::new(lines), f.area());
+    }
+
+    /// lealand, then the path as ~ › utils › lealand with the folder you're in brightest.
+    fn crumbs(&self) -> Line<'static> {
+        let mut spans = vec![
+            Span::styled(" \u{f06c} ", Style::new().fg(pal::DIR)),
+            Span::styled("lealand", Style::new().fg(pal::DIR).add_modifier(Modifier::ITALIC)),
+            Span::raw("   "),
+        ];
+        let path = tilde(&self.dir);
+        let mut parts: Vec<String> = path.split('/').filter(|p| !p.is_empty()).map(String::from).collect();
+        if path.starts_with('/') {
+            parts.insert(0, "/".into());
+        }
+        let last = parts.len().saturating_sub(1);
+        for (i, p) in parts.into_iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(" › ", Style::new().fg(pal::FAINT)));
+            }
+            spans.push(if i == last { Span::styled(p, Style::new().fg(pal::TEXT).bold()) } else { Span::styled(p, Style::new().fg(pal::DIM)) });
+        }
+        spans.push(git_summary(&self.git));
+        Line::from(spans)
     }
 
     fn status(&self) -> Line<'static> {
         if !self.pending.is_empty() {
-            return Line::from(format!("{}… ", self.pending).yellow().bold());
+            return Line::from(format!("{}… ", self.pending).fg(pal::AMBER).bold());
         }
         if self.esc_at.is_some() {
-            return Line::from("esc again to leave ".yellow());
+            return Line::from("esc again to leave ".fg(pal::AMBER));
         }
         if let Some((m, _)) = &self.msg {
-            return Line::from(format!("{m} ").red());
+            return Line::from(format!("{m} ").fg(pal::RED));
         }
         let pos = if self.entries.len() > self.rows { format!("{}/{}  ", self.sel + 1, self.entries.len()) } else { String::new() };
-        Line::from(format!("{pos}? help ").dark_gray())
+        Line::from(format!("{pos}? help ").fg(pal::DIM))
     }
 
     /// Widest name (with its link target) and widest flags in this folder, so columns sit right
@@ -821,7 +937,8 @@ impl App {
         for i in 0..self.entries.len() {
             let e = &self.entries[i];
             let link = e.link.as_ref().map_or(0, |t| 3 + t.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>());
-            w.0 = w.0.max((e.name.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>() + link).min(40));
+            let slash = usize::from(e.dir);
+            w.0 = w.0.max((e.name.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>() + link + slash).min(40));
             w.1 = w.1.max(self.flags(i).chars().count());
         }
         self.widths = Some(w);
@@ -843,38 +960,43 @@ impl App {
         let e = &self.entries[i];
         let git = self.git.get(&e.name).copied();
         let base = if e.hidden {
-            Style::new().fg(Color::DarkGray)
+            Style::new().fg(pal::FAINT)
         } else if e.dir {
-            Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD)
+            Style::new().fg(pal::DIR).add_modifier(Modifier::BOLD)
         } else if e.link.is_some() {
-            Style::new().fg(Color::Cyan)
+            Style::new().fg(pal::LINK)
         } else if e.mode & 0o111 != 0 {
-            Style::new().fg(Color::Green)
+            Style::new().fg(pal::LEAF)
         } else {
-            Style::new()
+            Style::new().fg(pal::TEXT)
         };
         let mut name = e.name.clone();
+        if e.dir {
+            name.push('/');
+        }
         if let Some(t) = &e.link {
             name += &format!(" → {t}");
         }
-        let dim = Style::new().fg(Color::DarkGray);
+        let dim = Style::new().fg(pal::FAINT);
         let (gc, gs) = match git {
-            Some('?') => ("?", Style::new().fg(Color::Magenta)),
-            Some('D') => ("D", Style::new().fg(Color::Red)),
-            Some('A') => ("A", Style::new().fg(Color::Green)),
-            Some(c) => (if c == 'M' { "M" } else { "~" }, Style::new().fg(Color::Yellow)),
+            Some('?') => ("?", Style::new().fg(pal::LILAC)),
+            Some('D') => ("D", Style::new().fg(pal::RED)),
+            Some('A') => ("A", Style::new().fg(pal::LEAF)),
+            Some(c) => (if c == 'M' { "M" } else { "~" }, Style::new().fg(pal::ROSE)),
             None => (" ", dim),
         };
+        let selected = i == self.sel;
         let mut l = Line::from(vec![
-            Span::styled(format!(" {} ", icon(e)), base.remove_modifier(Modifier::BOLD)),
+            Span::styled(if selected { "▎" } else { " " }, Style::new().fg(pal::DIR)),
+            Span::styled(format!("{} ", icon(e)), base.remove_modifier(Modifier::BOLD)),
             Span::styled(fit(&name, name_w), base),
             Span::styled(format!("{size:>9}"), dim),
             Span::styled(format!("  {:<9}", ago(e.mtime)), dim),
             Span::styled(format!(" {gc}"), gs),
-            Span::styled(format!(" {flags}"), Style::new().fg(Color::Yellow)),
+            Span::styled(format!(" {flags}"), Style::new().fg(pal::AMBER)),
         ]);
-        if i == self.sel {
-            l = l.style(Style::new().bg(SEL_BG));
+        if selected {
+            l = l.style(Style::new().bg(pal::SEL));
         }
         l
     }
@@ -889,23 +1011,23 @@ impl App {
         }
         let lines: Vec<Line<'static>> = if e.dir {
             match read_entries(&path) {
-                Ok(v) if v.is_empty() => vec![Line::from(" empty".dark_gray())],
+                Ok(v) if v.is_empty() => vec![Line::from(" empty".fg(pal::DIM))],
                 Ok(v) => v
                     .iter()
                     .take(n)
                     .map(|c| {
-                        let s = if c.hidden { Style::new().fg(Color::DarkGray) } else if c.dir { Style::new().fg(Color::Blue) } else { Style::new() };
+                        let s = if c.hidden { Style::new().fg(pal::FAINT) } else if c.dir { Style::new().fg(pal::DIR) } else { Style::new() };
                         Line::from(Span::styled(format!(" {} {}", icon(c), c.name), s))
                     })
                     .collect(),
-                Err(e) => vec![Line::from(format!(" {}", e.kind()).red())],
+                Err(e) => vec![Line::from(format!(" {}", e.kind()).fg(pal::RED))],
             }
         } else {
             let mut buf = vec![0; 64 * 1024];
             let got = File::open(&path).and_then(|mut f| f.read(&mut buf)).unwrap_or(0);
             buf.truncate(got);
             if buf.contains(&0) {
-                vec![Line::from(format!(" binary, {}", human(e.size)).dark_gray())]
+                vec![Line::from(format!(" binary, {}", human(e.size)).fg(pal::DIM))]
             } else {
                 String::from_utf8_lossy(&buf).lines().take(n).map(|l| Line::from(format!(" {}", l.replace('\t', "    ")))).collect()
             }
@@ -915,7 +1037,55 @@ impl App {
     }
 }
 
-const SEL_BG: Color = Color::Indexed(237);
+/// The logo's colours, used everywhere.
+mod pal {
+    use ratatui::style::Color::{self, Rgb};
+    pub const TEXT: Color = Rgb(0xe8, 0xe1, 0xcf); // cream, like the wordmark
+    pub const DIR: Color = Rgb(0x9e, 0xd3, 0x8a); // willow
+    pub const LEAF: Color = Rgb(0xc8, 0xe0, 0x7c); // young leaf, for things that run
+    pub const LINK: Color = Rgb(0x7b, 0xc4, 0xb8);
+    pub const DIM: Color = Rgb(0x86, 0x94, 0x82); // sage
+    pub const FAINT: Color = Rgb(0x5d, 0x66, 0x5a);
+    pub const AMBER: Color = Rgb(0xe0, 0xa8, 0x5c);
+    pub const ROSE: Color = Rgb(0xe0, 0x8a, 0x9a);
+    pub const LILAC: Color = Rgb(0xb7, 0x9f, 0xd9);
+    pub const RED: Color = Rgb(0xe0, 0x6c, 0x6c);
+    pub const SEL: Color = Rgb(0x22, 0x30, 0x25); // the selected row
+}
+
+/// Launch animation, in ms: log lines, then the wordmark wipes in, holds, dissolves, and the
+/// listing's rows come in one after another.
+const LOGO_AT: u128 = 90;
+const DISSOLVE_AT: u128 = 380;
+const INTRO_END: u128 = 530;
+const ROW_STEP: u128 = 14;
+const LOG_LINES: usize = 5;
+
+fn splash_off_file() -> PathBuf {
+    env::var_os("XDG_CONFIG_HOME").map_or_else(|| jump::home().join(".config"), PathBuf::from).join("lealand/no-flag")
+}
+
+fn rgb(v: u32) -> Color {
+    Color::Rgb((v >> 16) as u8, (v >> 8) as u8, v as u8)
+}
+
+/// Fixed per-cell noise in 0..1, for the dissolve.
+fn noise(x: usize, y: usize) -> f64 {
+    let h = (x as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (y as u64).wrapping_mul(0xc2b2_ae3d_27d4_eb4f);
+    (h >> 40) as f64 / (1u64 << 24) as f64
+}
+
+fn thousands(n: usize) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
 
 fn picked(apps: &[apps::App], filter: &str) -> Vec<usize> {
     let f = filter.to_lowercase();
@@ -1052,7 +1222,7 @@ fn git_status(dir: PathBuf) -> mpsc::Receiver<(PathBuf, HashMap<String, char>)> 
 }
 
 fn git_summary(git: &HashMap<String, char>) -> Span<'static> {
-    if git.is_empty() { "".into() } else { format!("  {} changed", git.len()).yellow() }
+    if git.is_empty() { "".into() } else { format!("   {} changed", git.len()).fg(pal::ROSE) }
 }
 
 /// Runs something in its own session with no terminal, so it can't scribble on the view or die with it.
