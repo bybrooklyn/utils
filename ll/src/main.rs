@@ -902,7 +902,7 @@ fn git_status(dir: PathBuf) -> mpsc::Receiver<(PathBuf, HashMap<String, char>)> 
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let git = |args: &[&str]| {
-            let o = Command::new("git").arg("-C").arg(&dir).args(args).stderr(Stdio::null()).output().ok()?;
+            let o = Command::new("git").arg("-C").arg(&dir).args(args).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
             o.status.success().then_some(o.stdout)
         };
         let Some(prefix) = git(&["rev-parse", "--show-prefix"]) else { return };

@@ -59,3 +59,18 @@ export PATH=/home/brook/.opencode/bin:$PATH
 # Android SDK/NDK for BoxOfFizz (Quest builds with cargo-ndk)
 export ANDROID_HOME="$HOME/Android/Sdk"
 export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/29.0.14206865"
+
+# ll (~/utils/ll): walk around with the arrows, qq to cd where you ended up.
+# The binary prints the folder and maybe a command; this does the cd and runs it.
+unalias ll 2>/dev/null
+ll() {
+    local out
+    out=$(command ll "$@") || return
+    [[ -n $out ]] || return 0
+    cd -- "${out%%$'\n'*}" || return
+    [[ $out == *$'\n'* ]] && eval "${out#*$'\n'}"
+}
+# every cd counts towards ll's / jump
+zmodload zsh/datetime
+_ll_visit() { { print -r -- "$EPOCHSECONDS $PWD" >>| ${XDG_DATA_HOME:-$HOME/.local/share}/ll/visits } 2>/dev/null }
+autoload -Uz add-zsh-hook && add-zsh-hook chpwd _ll_visit

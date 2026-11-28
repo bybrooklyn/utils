@@ -8,6 +8,7 @@ General stuff I use every day on my PC and my home server. Each folder is its ow
 | [quest-wireless-adb](quest-wireless-adb/) | Turns wireless adb back on every time a Meta Quest reboots. |
 | [mc-gate](mc-gate/) | One front door for my Minecraft servers: routes by name, wakes sleeping servers when someone joins, stops empty ones. |
 | [dotfiles](dotfiles/) | My zsh setup and prompt, plus btop, fastfetch and micro configs. |
+| [ll](ll/) | Walk around folders with the arrow keys under the prompt, land the shell where you stop. Two-letter chords open Claude Code, Dolphin and the rest. |
 | [soem](soem/) | Lines of code per folder, drawn as bars. Built on tokei. |
 | [cwpl](cwpl/) | Charlotte's Weak Copyleft Public License: the Mozilla Public License 2.0 plus a network clause. |
 
@@ -31,6 +32,7 @@ Everything here is built for my setup: CachyOS (Arch) with KDE Plasma on Wayland
    bash ~/utils/quest-wireless-adb/install.sh
    bash ~/utils/dotfiles/install.sh
    bash ~/utils/soem/install.sh
+   bash ~/utils/ll/install.sh
    ```
 
 4. To update later, `git -C ~/utils pull` and run the installer again. They're all safe to run twice.
