@@ -41,7 +41,7 @@ use unicode_width::UnicodeWidthChar;
 const GAP: Duration = Duration::from_millis(300);
 
 /// `keys action [command]`. ~/.config/ll/chords uses the same format and wins; `xx none` removes one.
-const DEFAULT_CHORDS: &str = "
+const DEFAULT_CHORDS: &str = r#"
 qq    quit
 ?     help
 fu    full
@@ -49,8 +49,8 @@ op    open-with
 cl    exit  claude
 fi    spawn dolphin .
 code  spawn code .
-tt    spawn ghostty +new-tab --working-directory=.
-";
+tt    spawn ghostty +new-tab --working-directory="$PWD"
+"#;
 
 type Term = Terminal<CrosstermBackend<io::Stdout>>;
 
@@ -483,7 +483,7 @@ impl App {
             },
             Action::Spawn(cmd) => {
                 let mut c = Command::new("sh");
-                c.arg("-c").arg(&cmd).current_dir(&self.dir);
+                c.arg("-c").arg(&cmd).current_dir(&self.dir).env("PWD", &self.dir);
                 if let Some(e) = self.selected() {
                     c.env("f", &e.path);
                 }

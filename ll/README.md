@@ -39,16 +39,17 @@ Each key of a chord has to come within 300 ms of the last one.
 Add or change chords in `~/.config/ll/chords`, one per line:
 
 ```
-gi    spawn lazygit
+gi    exit  lazygit
 cl    exit  claude --continue
+ko    spawn konsole
 code  none
 ```
 
-`spawn` runs a command in the current folder and stays open, `exit` quits and runs it in your shell after the cd, `none` removes a chord. `$f` is the file under the cursor. A chord can't be the start of another one (`c` and `cl`), and ll says so in the corner if you try.
+`spawn` runs a command in the current folder with no terminal, for apps with their own window, and ll stays open. `exit` quits and runs the command in your shell after the cd, so terminal programs go there. `none` removes a chord. A `spawn` command gets the file under the cursor as `$f`. A chord can't be the start of another one (`c` and `cl`), and ll says so in the corner if you try.
 
 ## Jumping
 
-`/` knows every folder under `~` except hidden ones, anything a `.gitignore` covers (the same rules tokei and soem use), and build or cache folders like `node_modules`, `target`, `go/pkg` and Wine prefixes. Typos are fine: `/dwonlods` finds Downloads. The rest of the best match shows greyed out as you type, like zsh-autosuggestions.
+`/` knows every folder under `~` except hidden ones (`~/.config` is the exception), anything a `.gitignore` covers (the same rules tokei and soem use), and build or cache folders like `node_modules`, `target`, `go/pkg` and Wine prefixes. Typos are fine: `/dwonlods` finds Downloads. The rest of the best match shows greyed out as you type, like zsh-autosuggestions.
 
 Folders you go to often and recently rank higher. That comes from every `cd` in zsh (a hook in the dotfiles zshrc), every folder you open in ll, and on the first run, the `cd`s in `~/.zsh_history`.
 

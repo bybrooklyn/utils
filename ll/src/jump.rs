@@ -84,12 +84,19 @@ fn walk() -> Vec<PathBuf> {
     for g in SKIP {
         ov.add(&format!("!{g}")).unwrap();
     }
+    let config = home.join(".config");
     let out = Mutex::new(Vec::new());
     let out_ref = &out;
+    // hidden folders are skipped like tokei does, except ~/.config, which you do go into
     WalkBuilder::new(&home)
+        .add(home.join(".config"))
         .overrides(ov.build().unwrap())
         .max_depth(Some(12))
-        .filter_entry(|e| e.file_type().is_some_and(|t| t.is_dir()))
+        // ~/.config/app/part, no deeper: below that it's mostly browser and Electron caches
+        .filter_entry(move |e| {
+            e.file_type().is_some_and(|t| t.is_dir())
+                && e.path().strip_prefix(&config).map_or(true, |rest| rest.components().count() <= 2)
+        })
         .threads(thread::available_parallelism().map_or(8, |n| n.get()))
         .build_parallel()
         .run(|| {
