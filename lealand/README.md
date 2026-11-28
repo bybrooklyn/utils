@@ -15,10 +15,11 @@ The listing is only as wide as its longest name. The last column is empty unless
 
 ## Keys
 
-- **← →** go up a folder, or open the folder or file. Enter also opens.
+- **← →** go up a folder, or open the folder or file. Enter also opens. ← stops at `~` unless you started outside it. → on a program or script runs it here and waits for a key after, so you can read what it printed.
 - **↑ ↓** move one, **ctrl ↑ ↓** move five. **pgup pgdn home end** do what they say.
 - **backspace** goes back to the folder you were in before.
 - **/** jumps to any folder. Type part of its name and press tab.
+- **:** is a small command line. `cd lealand`, `cd ..` and `cd ~/data` move, and a name that isn't here goes through the `/` jump, so `cd novean` works from anywhere. Tab completes folder names. Anything else, like `claude`, `mkdir x` or `code .`, runs in the shell in this folder and ll comes back after. ↑ ↓ bring back earlier commands.
 - **esc esc** quits and leaves the shell where it was.
 - **the mouse** works too: click a row to pick it, click it again to open it, scroll with the wheel.
 
@@ -36,18 +37,18 @@ Each key of a chord has to come within a second of the last one, and while you'r
 - **mk** make a folder. Type its name in the top line and press Enter
 - **mkcl** make a folder, cd into it and run `claude`
 - **rm** move the file or folder to the trash, after a y/n
-- **?** list all of this
+- **?** the wordmark, this machine (CPU, GPU, memory, monitors, storage) and all the chords and keys
 
-Add or change chords in `~/.config/lealand/chords`, one per line:
+The chords live in `~/.config/lealand/lealand.csv`, one per row, so a spreadsheet can edit them too:
 
 ```
-gi    exit  lazygit
-cl    exit  claude --continue
-ko    spawn konsole
-code  none
+keys,action,command
+gi,exit,lazygit
+cl,exit,claude --continue
+ko,spawn,konsole
 ```
 
-`mkdir` and `mkdir-exit <command>` ask for a folder name, and `trash` asks before moving things to the trash. `spawn` runs a command in the current folder with no terminal, for apps with their own window, and ll stays open. `exit` quits and runs the command in your shell after the cd, so terminal programs go there. `none` removes a chord. A `spawn` command gets the file under the cursor as `$f`.
+Delete a row to drop a chord. `mkdir` and `mkdir-exit <command>` ask for a folder name, and `trash` asks before moving things to the trash. `spawn` runs a command in the current folder with no terminal, for apps with their own window, and ll stays open. `exit` quits and runs the command in your shell after the cd, so terminal programs go there. A `spawn` command gets the file under the cursor as `$f`.
 
 ## Jumping
 
@@ -59,7 +60,15 @@ With nothing typed yet, the list is the folders you go to most, so `/` then Tab 
 
 ## Opening files
 
-The first time you open a type of file, ll lists the apps that handle it, with KDE's default on top and every other app below. Type to filter. It remembers the pick for that MIME type. `op` asks again and remembers the new answer. The app picked before is marked `current`, and Delete in the list forgets it, so the next open asks. After opening a file with a remembered app, the corner says which app and that `op` picks another. Terminal apps like micro run in place and ll comes back when they exit.
+The first time you open a type of file, ll lists the apps made for it, with KDE's default on top. Every other app is folded into one row until you open it or start typing. Search matches names, initials (`vsc` is Visual Studio Code) and commands (`code`). Enter opens the file and remembers the app for that MIME type, and Tab opens it just this once. `op` asks again. The app picked before is marked `current`, and Delete forgets it. Terminal apps like micro run in place and ll comes back when they exit.
+
+## Settings
+
+The first run writes `~/.config/lealand/lealand.toml` with every setting and a comment on each: the animations, how tall the view may get, whether dotfiles are dimmed, mixed in or hidden, the chord timing, the folders `/` skips, and the app remembered for each kind of file. Edit it as you like. When ll changes something there itself, it rewrites only that line.
+
+## ll fetch
+
+`ll fetch` prints this machine in a few lines, like fastfetch without the logo: OS, kernel, uptime, desktop, shell, terminal, CPU, GPUs, memory, monitors (by the names in their EDID) and storage. It takes about 7 ms.
 
 ## Starting up
 
@@ -77,9 +86,9 @@ It needs cargo, a Nerd Font for the icons, and a terminal with 24-bit colour. Th
 
 | file | what |
 |---|---|
-| `~/.config/lealand/chords` | your chords |
-| `~/.config/lealand/apps` | the app picked for each MIME type |
-| `~/.config/lealand/no-flag` | there when the launch animation is off |
+| `~/.config/lealand/lealand.toml` | settings, and the app picked for each MIME type |
+| `~/.config/lealand/lealand.csv` | the chords |
+| `~/.local/share/lealand/history` | commands typed after `:` |
 | `~/.local/share/lealand/visits` | where you've been, for ranking `/` |
 | `~/.cache/lealand/dirs` | the folder index, rebuilt in the background when it's over an hour old |
 

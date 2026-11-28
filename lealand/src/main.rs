@@ -82,6 +82,7 @@ enum Mode {
     Jump { q: String, at: Instant, sel: usize, hits: Vec<PathBuf> },
     Pick { file: PathBuf, mime: String, apps: Vec<apps::App>, handles: usize, filter: String, sel: usize, current: Option<PathBuf>, more: bool },
     Name { text: String, then: Option<String> },
+    Cmd { text: String, back: usize },
     Confirm(PathBuf),
 }
 
@@ -275,6 +276,7 @@ fn run(app: &mut App) -> io::Result<()> {
                 app.flash(format!("couldn't run it: {e}"));
             }
             terminal::enable_raw_mode()?;
+            app.refresh();
             if std::mem::take(&mut app.tty_wait) {
                 if let Ok(st) = status {
                     let code = st.code().map_or("a signal".to_string(), |c| c.to_string());
@@ -405,7 +407,7 @@ impl App {
             return self.intro_height();
         }
         let want = match &self.mode {
-            Mode::Browse | Mode::Name { .. } | Mode::Confirm(_) => self.entries.len().max(1),
+            Mode::Browse | Mode::Name { .. } | Mode::Confirm(_) | Mode::Cmd { .. } => self.entries.len().max(1),
             Mode::Help => 999, // as tall as the terminal
             Mode::Jump { .. } => self.entries.len().max(8),
             Mode::Pick { apps, handles, filter, more, .. } => pick_rows(apps, *handles, filter, *more).len().clamp(3, 16),
@@ -530,6 +532,14 @@ impl App {
         Ok(v)
     }
 
+    /// Reads the folder again (after a command may have changed it), keeping the cursor's file.
+    fn refresh(&mut self) {
+        let name = self.selected().map(|e| e.name.clone());
+        let (dir, back) = (self.dir.clone(), self.back.clone());
+        self.go(dir, name, false);
+        self.back = back;
+    }
+
     fn go(&mut self, dir: PathBuf, select: Option<String>, remember: bool) {
         let entries = match self.listing(&dir) {
             Ok(e) => e,
@@ -576,6 +586,34 @@ impl App {
                     self.trash(p);
                 }
             }
+            Mode::Cmd { text, back } => match (ch, combo) {
+                (Some(c), _) => {
+                    text.push(c);
+                    *back = 0;
+                }
+                (_, key!(backspace)) => {
+                    if text.pop().is_none() {
+                        self.mode = Mode::Browse;
+                    }
+                }
+                (_, key!(tab) | key!(right)) => {
+                    if let Some(more) = complete(&self.dir, text) {
+                        text.push_str(&more);
+                    }
+                }
+                (_, key!(up) | key!(down)) => {
+                    let hist = history();
+                    *back = if combo == key!(up) { (*back + 1).min(hist.len()) } else { back.saturating_sub(1) };
+                    *text = if *back == 0 { String::new() } else { hist[hist.len() - *back].clone() };
+                }
+                (_, key!(enter)) => {
+                    let line = text.trim().to_string();
+                    self.mode = Mode::Browse;
+                    self.command(&line);
+                }
+                (_, key!(esc)) => self.mode = Mode::Browse,
+                _ => {}
+            },
             Mode::Name { text, then } => match (ch, combo) {
                 (Some(c), _) => text.push(c),
                 (_, key!(backspace)) => {
@@ -666,6 +704,10 @@ impl App {
                 }
             }
             Mode::Browse => match (ch, combo) {
+                (Some(':'), _) => {
+                    self.pending.clear();
+                    self.mode = Mode::Cmd { text: String::new(), back: 0 };
+                }
                 (Some('/'), _) => {
                     self.pending.clear();
                     self.mode = Mode::Jump { q: String::new(), at: Instant::now(), sel: 0, hits: Vec::new() };
@@ -710,6 +752,43 @@ impl App {
                 }
                 _ => {}
             },
+        }
+    }
+
+    /// What you typed after `:`. cd moves (by path, or by / jump when it isn't a path from here),
+    /// q quits, and anything else runs in the shell here, with ll back after.
+    fn command(&mut self, line: &str) {
+        if line.is_empty() {
+            return;
+        }
+        remember_command(line);
+        let (word, arg) = line.split_once(' ').map_or((line, ""), |(w, a)| (w, a.trim()));
+        match word {
+            "q" | "quit" | "exit" => self.act(Action::Quit),
+            "cd" => {
+                if arg.is_empty() || arg == "~" {
+                    return self.go(jump::home(), None, true);
+                }
+                let path = match arg.strip_prefix("~/") {
+                    Some(rest) => jump::home().join(rest),
+                    None => self.dir.join(arg),
+                };
+                if let Some(p) = fs::canonicalize(&path).ok().filter(|p| p.is_dir()) {
+                    let from = self.dir.file_name().map(|n| n.to_string_lossy().into_owned());
+                    let select = if arg.trim_end_matches('/') == ".." { from } else { None };
+                    return self.go(p, select, true);
+                }
+                let local: Vec<PathBuf> = self.entries.iter().filter(|e| e.dir).map(|e| e.path.clone()).collect();
+                match self.index.search(arg.trim_end_matches('/'), &self.dir, &local).into_iter().next() {
+                    Some(p) => self.go(p, None, true),
+                    None => self.flash(format!("no folder called {arg}")),
+                }
+            }
+            _ => {
+                let mut c = Command::new("sh");
+                c.arg("-c").arg(line).current_dir(&self.dir).env("PWD", &self.dir);
+                self.tty_cmd = Some(c);
+            }
         }
     }
 
@@ -1003,7 +1082,7 @@ impl App {
             let want = match self.mode {
                 Mode::Browse if !self.pending.is_empty() => (self.row_width() + 2).max(self.chord_hints().width() + 2),
                 Mode::Browse => (self.row_width() + 2).max(58),
-                Mode::Name { .. } | Mode::Confirm(_) => self.row_width().max(72),
+                Mode::Name { .. } | Mode::Confirm(_) | Mode::Cmd { .. } => self.row_width().max(72),
                 _ => area.width as usize,
             };
             (Rect { width: (want as u16).min(area.width), ..area }, None)
@@ -1018,7 +1097,7 @@ impl App {
         let left: Line;
         let rows = body.height as usize;
         match &self.mode {
-            Mode::Browse | Mode::Name { .. } | Mode::Confirm(_) => {
+            Mode::Browse | Mode::Name { .. } | Mode::Confirm(_) | Mode::Cmd { .. } => {
                 (left, right) = self.head();
                 if self.sel < self.scroll {
                     self.scroll = self.sel;
@@ -1154,6 +1233,13 @@ impl App {
                 let after = then.as_ref().map_or("enter makes it".into(), |c| format!("enter makes it and runs {c}"));
                 (Line::from(vec!["   new folder: ".fg(pal::AMBER), text.clone().bold(), "▏".into()]), Line::from(format!("{after}, esc cancels ").fg(pal::DIM)))
             }
+            Mode::Cmd { text, .. } => {
+                let ghost = complete(&self.dir, text).unwrap_or_default();
+                (
+                    Line::from(vec!["   : ".fg(pal::AMBER).bold(), text.clone().fg(pal::TEXT), ghost.fg(pal::FAINT), "▏".fg(pal::AMBER)]),
+                    Line::from(format!("{} ", tilde(&self.dir)).fg(pal::DIM)),
+                )
+            }
             Mode::Confirm(p) => {
                 let name = p.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
                 (Line::from(vec!["   trash ".fg(pal::RED), name.bold(), "?".into()]), Line::from("y moves it to the trash, any other key keeps it ".fg(pal::DIM)))
@@ -1229,6 +1315,7 @@ impl App {
             ("pgup pgdn", "a page, home and end for first and last"),
             ("backspace", "back to the last folder"),
             ("/", "jump to any folder: type a bit, tab to go"),
+            (":", "cd somewhere, or run a shell command here"),
             ("mouse", "click picks, click again opens, wheel moves"),
             ("esc esc", "quit, shell stays where it was"),
         ] {
@@ -1292,6 +1379,7 @@ impl App {
     fn footer(&self) -> Line<'static> {
         let say = match &self.mode {
             Mode::Jump { .. } => "tab or enter goes  ·  ↑ ↓ picks  ·  esc cancels".to_string(),
+            Mode::Cmd { .. } => "cd somewhere, or any shell command here  ·  tab completes  ·  ↑ ↓ earlier ones  ·  esc".to_string(),
             Mode::Pick { .. } => "enter opens and remembers  ·  tab just this once  ·  del forgets  ·  esc".to_string(),
             Mode::Help => "chords are in ~/.config/lealand/lealand.csv, settings in lealand.toml".to_string(),
             _ if !self.pending.is_empty() => return self.chord_hints(),
@@ -1651,6 +1739,47 @@ fn friendly(cmd: &str) -> String {
         _ => return format!("`{cmd}`"),
     };
     name.into()
+}
+
+/// The rest of a folder name for the last word typed after `cd `, if one starts that way.
+fn complete(dir: &Path, text: &str) -> Option<String> {
+    let arg = text.strip_prefix("cd ")?;
+    let (base, part) = match arg.rfind('/') {
+        Some(i) => (&arg[..=i], &arg[i + 1..]),
+        None => ("", arg),
+    };
+    let root = match base.strip_prefix("~/") {
+        Some(rest) => jump::home().join(rest),
+        None if base.starts_with('/') => PathBuf::from(base),
+        None => dir.join(base),
+    };
+    let lower = part.to_lowercase();
+    let mut names: Vec<String> = fs::read_dir(root)
+        .ok()?
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.to_lowercase().starts_with(&lower) && (part.starts_with('.') || !n.starts_with('.')))
+        .collect();
+    names.sort_by(|a, b| natural(a, b));
+    let name = names.first()?;
+    Some(format!("{}/", &name[part.len()..])).filter(|s| s != "/" || !part.is_empty())
+}
+
+fn history_file() -> PathBuf {
+    env::var_os("XDG_DATA_HOME").map_or_else(|| jump::home().join(".local/share"), PathBuf::from).join("lealand/history")
+}
+
+fn history() -> Vec<String> {
+    fs::read_to_string(history_file()).unwrap_or_default().lines().map(String::from).collect()
+}
+
+fn remember_command(line: &str) {
+    let mut h = history();
+    h.retain(|l| l != line);
+    h.push(line.to_string());
+    let keep = h.len().saturating_sub(200);
+    let _ = fs::write(history_file(), h[keep..].join("\n") + "\n");
 }
 
 /// The chords from lealand.csv, one row each: keys, action, command.
