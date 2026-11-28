@@ -39,8 +39,11 @@ use std::{
 };
 use unicode_width::UnicodeWidthChar;
 
-/// Keys of a chord must come within this long of each other.
-const GAP: Duration = Duration::from_millis(300);
+/// Keys of a chord must come within this long of each other. The footer shows what can follow
+/// while you think, and enter or space runs a chord that is waiting for a longer one.
+const GAP: Duration = Duration::from_millis(1000);
+/// Esc twice within this long quits.
+const ESC_GAP: Duration = Duration::from_millis(400);
 
 /// `keys action [command]`. ~/.config/lealand/chords uses the same format and wins; `xx none` removes one.
 /// A chord that starts a longer one (mk, mkcl) fires when no next key comes within GAP.
@@ -336,7 +339,7 @@ impl App {
             self.cascade = None;
         }
         self.expire();
-        if self.esc_at.is_some_and(|t| t.elapsed() > GAP) {
+        if self.esc_at.is_some_and(|t| t.elapsed() > ESC_GAP) {
             self.esc_at = None;
         }
         if self.msg.as_ref().is_some_and(|m| m.1.elapsed() > Duration::from_secs(3)) {
@@ -497,6 +500,11 @@ impl App {
                 (_, key!(pagedown)) => self.step(self.rows as isize),
                 (_, key!(home)) => self.sel = 0,
                 (_, key!(end)) => self.step(isize::MAX / 2),
+                (_, key!(enter)) if !self.pending.is_empty() => {
+                    if !self.fire_pending() {
+                        self.pending.clear();
+                    }
+                }
                 (_, key!(right) | key!(enter)) => match self.selected() {
                     Some(e) if e.dir => self.go(e.path.clone(), None, true),
                     Some(e) => self.open(e.path.clone(), false),
@@ -536,6 +544,19 @@ impl App {
         }
     }
 
+    /// Runs the chord typed so far, if it is one. True when it ran.
+    fn fire_pending(&mut self) -> bool {
+        let p = self.pending.clone();
+        match self.chords.iter().find(|c| c.keys == p).map(|c| c.act.clone()) {
+            Some(act) => {
+                self.pending.clear();
+                self.act(act);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// A chord left waiting for a longer one fires once the gap has passed.
     fn expire(&mut self) {
         if !self.pending.is_empty() && self.pending_at.elapsed() > GAP {
@@ -548,6 +569,9 @@ impl App {
 
     fn feed(&mut self, c: char) {
         self.expire();
+        if c == ' ' && self.fire_pending() {
+            return;
+        }
         self.pending_at = Instant::now();
         self.pending.push(c);
         let starts = |p: &str| self.chords.iter().any(|ch| ch.keys.starts_with(p));
@@ -739,6 +763,7 @@ impl App {
         } else {
             // inline, the view is only as wide as its rows
             let want = match self.mode {
+                Mode::Browse if !self.pending.is_empty() => (self.row_width() + 2).max(self.chord_hints().width() + 2),
                 Mode::Browse => (self.row_width() + 2).max(58),
                 Mode::Name { .. } | Mode::Confirm(_) => self.row_width().max(72),
                 _ => area.width as usize,
@@ -940,12 +965,28 @@ impl App {
         f.render_widget(Paragraph::new(lines), f.area());
     }
 
+    /// While a chord is half typed: the keys that can come next and what they do.
+    fn chord_hints(&self) -> Line<'static> {
+        let mut spans: Vec<Span<'static>> = vec!["    ".into()];
+        for c in self.chords.iter().filter(|c| c.keys.starts_with(&self.pending)) {
+            if spans.len() > 1 {
+                spans.push("   ·   ".fg(pal::FAINT));
+            }
+            let rest = &c.keys[self.pending.len()..];
+            let key = if rest.is_empty() { "enter".to_string() } else { rest.to_string() };
+            spans.push(key.fg(pal::AMBER).bold());
+            spans.push(format!("  {}", describe(&c.act)).fg(pal::DIM));
+        }
+        Line::from(spans)
+    }
+
     /// The quiet line at the bottom: what's here, or the keys for the screen you're on.
     fn footer(&self) -> Line<'static> {
         let say = match &self.mode {
             Mode::Jump { .. } => "tab or enter goes  ·  ↑ ↓ picks  ·  esc cancels".to_string(),
             Mode::Pick { .. } => "enter opens  ·  type to filter  ·  del forgets  ·  esc cancels".to_string(),
             Mode::Help => "add your own in ~/.config/lealand/chords".to_string(),
+            _ if !self.pending.is_empty() => return self.chord_hints(),
             _ => {
                 let folders = self.entries.iter().filter(|e| e.dir).count();
                 let hidden = self.entries.iter().filter(|e| e.hidden).count();

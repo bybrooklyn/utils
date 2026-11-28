@@ -70,6 +70,7 @@ ll() {
     cd -- "${out%%$'\n'*}" || return
     [[ $out == *$'\n'* ]] && eval "${out#*$'\n'}"
 }
+alias lealand=ll
 # every cd counts towards lealand's / jump
 zmodload zsh/datetime
 _ll_visit() { { print -r -- "$EPOCHSECONDS $PWD" >>| ${XDG_DATA_HOME:-$HOME/.local/share}/lealand/visits } 2>/dev/null }
