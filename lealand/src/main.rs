@@ -273,7 +273,7 @@ impl App {
         };
         app.git_rx = Some(git_status(dir));
         let (cols, rows) = terminal::size().unwrap_or((0, 0));
-        if !splash_off_file().exists() && cols as usize >= 76 && rows >= app.intro_height() + 2 {
+        if !splash_off_file().exists() && cols as usize >= logo::LOGO.iter().map(|r| r.len()).max().unwrap_or(0) + 2 && rows >= app.intro_height() + 2 {
             app.intro = Some(Instant::now());
         }
         app
@@ -877,7 +877,7 @@ impl App {
         ];
         let gone = if t > DISSOLVE_AT { (t - DISSOLVE_AT) as f64 / (INTRO_END - DISSOLVE_AT) as f64 } else { 0.0 };
         let mut lines: Vec<Line> = Vec::new();
-        for (i, l) in logs.iter().enumerate().take((t / 18) as usize + 1) {
+        for (i, l) in logs.iter().enumerate().take((t / LOG_STEP) as usize + 1) {
             if noise(i, 99) < gone {
                 lines.push(Line::default());
                 continue;
@@ -887,7 +887,7 @@ impl App {
         }
         lines.resize(LOG_LINES + 1, Line::default());
         if t >= LOGO_AT {
-            let rows = ((t - LOGO_AT) / 10) as usize + 1;
+            let rows = ((t - LOGO_AT) / WIPE_STEP) as usize + 1;
             for (y, row) in logo::LOGO.iter().enumerate().take(rows) {
                 let mut spans = vec![Span::raw("  ")];
                 for (x, &(c, fg, bg)) in row.iter().enumerate() {
@@ -1072,9 +1072,11 @@ mod pal {
 
 /// Launch animation, in ms: log lines, then the wordmark wipes in, holds, dissolves, and the
 /// listing's rows come in one after another.
-const LOGO_AT: u128 = 90;
-const DISSOLVE_AT: u128 = 380;
-const INTRO_END: u128 = 530;
+const LOG_STEP: u128 = 30;
+const LOGO_AT: u128 = 160;
+const WIPE_STEP: u128 = 16;
+const DISSOLVE_AT: u128 = 760;
+const INTRO_END: u128 = 1060;
 const ROW_STEP: u128 = 14;
 const LOG_LINES: usize = 5;
 

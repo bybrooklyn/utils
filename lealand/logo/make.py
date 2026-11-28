@@ -1,10 +1,10 @@
 """Draws the lealand wordmark: "lealand" in Instrument Serif Italic under a weeping willow.
 
-    python3 logo/make.py path/to/InstrumentSerif-Italic.ttf
+    python3 logo/make.py path/to/InstrumentSerif-Italic.ttf [preview.png]
 
-Writes logo/logo-light.svg and logo/logo-dark.svg (for the README) and src/logo.rs (the same picture in
-coloured half-block characters, for the launch animation). Needs fonttools and pillow, and
-rsvg-convert. The font is OFL, from github.com/google/fonts/tree/main/ofl/instrumentserif.
+Writes logo/logo-light.svg and logo/logo-dark.svg (for the README) and src/logo.rs (the same
+picture in sextant characters, 2x3 dots a cell, for the launch animation). Needs fonttools,
+pillow and rsvg-convert. The font is OFL, from github.com/google/fonts/tree/main/ofl/instrumentserif.
 """
 
 import math, os, random, subprocess, sys, tempfile
@@ -14,15 +14,17 @@ from fontTools.pens.transformPen import TransformPen
 from PIL import Image
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-H = 330
+H = 340
 SIZE = 190  # font size in px
-BASE = 292  # baseline
+BASE = 300  # baseline
 LEFT = 70
+COLS, ROWS = 80, 18  # terminal size of the launch logo
 
-# willow greens, deep near the branch to light at the tips
-COLS, ROWS = 72, 17  # terminal size of the launch logo
-LEAVES = ["#24502c", "#2f6b3a", "#3f8a46", "#58a24f", "#7dbb5c", "#a3d06a", "#c8e07c"]
-BARK = ("#4a3426", "#7a5a3f")
+# willow greens: back layer, middle, front
+BACK = ["#1d3b24", "#24502c", "#2c5e33"]
+MID = ["#2f6b3a", "#3f8a46", "#4f9a4a", "#64ab52"]
+FRONT = ["#6fb65a", "#8cc663", "#a8d46a", "#c6e27c"]
+BARK = ("#3e2b1f", "#6e5038", "#8a6a4c")
 
 
 def word(font_path):
@@ -38,133 +40,195 @@ def word(font_path):
     return pen.getCommands(), x
 
 
-def bezier(p0, p1, p2, p3, t):
+def bez(p0, p1, p2, p3, t):
     u = 1 - t
     return tuple(u**3 * a + 3 * u * u * t * b + 3 * u * t * t * c + t**3 * d for a, b, c, d in zip(p0, p1, p2, p3))
 
 
-def willow(word_w, strands=38):
-    rnd = random.Random(7)
-    # the branch comes in from above the left edge and arches over the word
-    P = [(-20, 70), (170, 6), (430, 24), (LEFT + word_w + 30, 88)]
-    pts = [bezier(*P, i / 60) for i in range(61)]
+def tapered(P, w0, w1, steps=60):
+    """A branch: a filled shape along a cubic curve, w0 thick at the start, w1 at the end."""
+    pts = [bez(*P, i / steps) for i in range(steps + 1)]
     top, bot = [], []
     for i, (x, y) in enumerate(pts):
-        t = i / 60
-        a = pts[min(i + 1, 60)]
-        b = pts[max(i - 1, 0)]
+        a, b = pts[min(i + 1, steps)], pts[max(i - 1, 0)]
         dx, dy = a[0] - b[0], a[1] - b[1]
         n = math.hypot(dx, dy) or 1
-        w = 13 * (1 - t) ** 1.4 + 1.2
+        w = w1 + (w0 - w1) * (1 - i / steps) ** 1.3
         top.append((x - dy / n * w, y + dx / n * w))
         bot.append((x + dy / n * w, y - dx / n * w))
-    poly = top + bot[::-1]
-    branch = "M" + " L".join(f"{x:.1f},{y:.1f}" for x, y in poly) + "Z"
+    return "M" + " L".join(f"{x:.1f},{y:.1f}" for x, y in top + bot[::-1]) + "Z"
 
-    back, front = [], []
+
+def leaf(x, y, ang, length, width, color, opacity=1):
+    """A willow leaf: long, narrow, pointed at both ends, hanging from (x, y) at angle ang."""
+    a = math.radians(ang)
+    ex, ey = x + math.cos(a) * length, y + math.sin(a) * length
+    nx, ny = -math.sin(a) * width, math.cos(a) * width
+    mx, my = (x + ex) / 2, (y + ey) / 2
+    op = f' opacity="{opacity}"' if opacity < 1 else ""
+    return (
+        f'<path d="M{x:.1f},{y:.1f} Q{mx + nx:.1f},{my + ny:.1f} {ex:.1f},{ey:.1f} '
+        f'Q{mx - nx:.1f},{my - ny:.1f} {x:.1f},{y:.1f}Z" fill="{color}"{op}/>'
+    )
+
+
+def strand(rnd, x0, y0, length, palette, chunky, opacity=1):
+    """One hanging strand: a thin stem curving down in a soft S, with leaves along it."""
+    sway = rnd.uniform(-26, 22)
+    P = [(x0, y0), (x0 + sway * 0.2, y0 + length * 0.35), (x0 + sway * 1.1, y0 + length * 0.7), (x0 + sway * 0.8, y0 + length)]
+    out = []
+    pts = [bez(*P, i / 40) for i in range(41)]
+    stem = "M" + " L".join(f"{x:.1f},{y:.1f}" for x, y in pts)
+    sw = 3.2 if chunky else 0.9
+    out.append(f'<path d="{stem}" fill="none" stroke="#2c4a27" stroke-width="{sw}" stroke-linecap="round" opacity="{0.8 * opacity:.2f}"/>')
+    n = max(3, int(length / (11 if chunky else 7)))
+    for j in range(1, n + 1):
+        s = j / (n + 0.3)
+        x, y = bez(*P, s)
+        x2, y2 = bez(*P, min(s + 0.01, 1))
+        down = math.degrees(math.atan2(y2 - y, x2 - x))
+        side = 1 if j % 2 else -1
+        ang = down + side * rnd.uniform(12, 30)
+        ln = rnd.uniform(11, 17) * (1 - 0.4 * s) * (1.4 if chunky else 1)
+        wd = ln * (0.3 if chunky else 0.13)
+        col = palette[max(0, min(len(palette) - 1, int(s * len(palette) + rnd.uniform(-0.6, 0.9))))]
+        out.append(leaf(x, y, ang, ln, wd, col, opacity))
+    return "".join(out)
+
+
+def willow(word_w, strands=40, chunky=False):
+    rnd = random.Random(11)
+    right = LEFT + word_w + 30
+    # the main branch comes in from above the left edge and arches over the word
+    P = [(-20, 74), (170, 8), (430, 26), (right, 92)]
+    branches = [tapered(P, 15, 1.5)]
+    twigs = []
+    for t, length in [(0.3, 80), (0.56, 100), (0.78, 70)]:
+        x, y = bez(*P, t)
+        Q = [(x, y), (x + length * 0.35, y + 4), (x + length * 0.75, y + 16), (x + length, y + 38)]
+        branches.append(tapered(Q, 4, 0.8, 30))
+        twigs.append(Q)
+
+    back, mid, front = [], [], []
     for k in range(strands):
-        t = 0.12 + 0.88 * k / (strands - 1) + rnd.uniform(-0.01, 0.01)
-        x0, y0 = bezier(*P, t)
-        length = rnd.uniform(70, 235) * (0.55 + 0.45 * math.sin(math.pi * min(t * 1.15, 1)))
-        sway = rnd.uniform(-22, 18)
-        x1, y1 = x0 + sway * 0.4, y0 + length * 0.5
-        x2, y2 = x0 + sway, y0 + length
-        strand = f"M{x0:.1f},{y0:.1f} Q{x1:.1f},{y1:.1f} {x2:.1f},{y2:.1f}"
-        bits = [f'<path d="{strand}" fill="none" stroke="#3b5e34" stroke-width="1.1" opacity=".7"/>']
-        n = int(length / 9)
-        for j in range(1, n + 1):
-            s = j / (n + 0.6)
-            # point and direction along the quadratic strand
-            px = (1 - s) ** 2 * x0 + 2 * (1 - s) * s * x1 + s * s * x2
-            py = (1 - s) ** 2 * y0 + 2 * (1 - s) * s * y1 + s * s * y2
-            tx = 2 * (1 - s) * (x1 - x0) + 2 * s * (x2 - x1)
-            ty = 2 * (1 - s) * (y1 - y0) + 2 * s * (y2 - y1)
-            ang = math.degrees(math.atan2(ty, tx))
-            side = 1 if j % 2 else -1
-            lean = ang + side * rnd.uniform(18, 34)
-            col = LEAVES[min(len(LEAVES) - 1, int(s * len(LEAVES) * 0.85 + rnd.uniform(0, 1.6)))]
-            ln = rnd.uniform(9, 14) * (1 - 0.35 * s)
-            bits.append(
-                f'<ellipse cx="{px + side * 2.5:.1f}" cy="{py:.1f}" rx="{ln:.1f}" ry="{ln * 0.24:.1f}" '
-                f'transform="rotate({lean:.0f} {px + side * 2.5:.1f} {py:.1f})" fill="{col}"/>'
-            )
-        (front if k % 4 == 1 else back).append("".join(bits))
-    # a few loose leaves drifting down past the word
-    for _ in range(5):
-        x, y = rnd.uniform(LEFT, LEFT + word_w), rnd.uniform(BASE - 40, BASE + 20)
-        front.append(
-            f'<ellipse cx="{x:.1f}" cy="{y:.1f}" rx="7" ry="1.8" transform="rotate({rnd.uniform(-60, 60):.0f} {x:.1f} {y:.1f})" '
-            f'fill="{rnd.choice(LEAVES[3:])}" opacity=".85"/>'
-        )
-    return branch, back, front
+        t = 0.1 + 0.9 * k / (strands - 1) + rnd.uniform(-0.012, 0.012)
+        x0, y0 = bez(*P, t)
+        # longest over the middle of the word, some reaching past the baseline
+        reach = math.sin(math.pi * min(t * 1.1, 1)) ** 0.7
+        length = rnd.uniform(60, 250) * (0.45 + 0.55 * reach)
+        layer = k % 5
+        if layer in (0, 3):
+            back.append(strand(rnd, x0 + rnd.uniform(-6, 6), y0, length * 0.85, BACK, chunky, 0.85))
+        elif layer == 2:
+            front.append(strand(rnd, x0, y0, length, FRONT, chunky))
+        else:
+            mid.append(strand(rnd, x0, y0, length, MID, chunky))
+    for Q in twigs:
+        for s in (0.35, 0.65, 0.95):
+            x0, y0 = bez(*Q, s)
+            mid.append(strand(rnd, x0, y0, rnd.uniform(50, 140), MID, chunky))
+    # a few leaves falling past the word
+    if not chunky:
+        for _ in range(6):
+            x, y = rnd.uniform(LEFT, right - 30), rnd.uniform(BASE - 30, BASE + 28)
+            front.append(leaf(x, y, rnd.uniform(-50, 50), 10, 1.8, rnd.choice(FRONT), 0.85))
+    return branches, back, mid, front
 
 
-def svg(font_path, ink, strands=38):
-    """ink: 'auto' (light/dark by media query) or a fixed colour pair for rasterising."""
+def svg(font_path, ink, strands=40, chunky=False):
     path, word_w = word(font_path)
-    branch, back, front = willow(word_w, strands)
+    branches, back, mid, front = willow(word_w, strands, chunky)
     W = int(LEFT + word_w + 60)
-    light, dark = ("#16301c", "#2f5a35"), ("#f3ecd8", "#cfe6b0")
-    if ink != "auto":
-        light = dark = ink
-    style = f"""
-    .ink {{ fill: url(#inkL) }}
-    @media (prefers-color-scheme: dark) {{ .ink {{ fill: url(#inkD) }} }}""" if ink == "auto" else ".ink { fill: url(#inkL) }"
+    bark = "".join(f'<path d="{b}" fill="url(#bark)"/>' for b in branches)
     return f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}">
   <title>lealand</title>
-  <style>{style}
-  </style>
   <defs>
-    <linearGradient id="inkL" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="{light[0]}"/><stop offset="1" stop-color="{light[1]}"/></linearGradient>
-    <linearGradient id="inkD" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="{dark[0]}"/><stop offset="1" stop-color="{dark[1]}"/></linearGradient>
-    <linearGradient id="bark" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="{BARK[0]}"/><stop offset="1" stop-color="{BARK[1]}"/></linearGradient>
+    <linearGradient id="ink" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="{ink[0]}"/><stop offset="1" stop-color="{ink[1]}"/></linearGradient>
+    <linearGradient id="bark" x1="0" y1="0" x2="1" y2="0.3"><stop offset="0" stop-color="{BARK[0]}"/><stop offset=".5" stop-color="{BARK[1]}"/><stop offset="1" stop-color="{BARK[2]}"/></linearGradient>
   </defs>
   <g>{"".join(back)}</g>
-  <path d="{branch}" fill="url(#bark)"/>
-  <path class="ink" d="{path}"/>
+  {bark}
+  <g>{"".join(mid)}</g>
+  <path d="{path}" fill="url(#ink)"/>
   <g>{"".join(front)}</g>
 </svg>
 """
 
 
+# Sextants: a cell is 2 dots wide and 3 high. Bit k is dot k, row by row from the top left.
+def sextant(bits):
+    if bits == 0:
+        return " "
+    if bits == 63:
+        return "█"
+    if bits == 21:
+        return "▌"
+    if bits == 42:
+        return "▐"
+    i = bits - 1 - (bits > 21) - (bits > 42)
+    return chr(0x1FB00 + i)
+
+
+def unsextant(c):
+    if c == "█":
+        return 63
+    if c == "▌":
+        return 21
+    if c == "▐":
+        return 42
+    bits = ord(c) - 0x1FB00 + 1
+    bits += bits >= 21
+    bits += bits >= 42
+    return bits
+
+
 def cells(font_path, cols, rows):
-    """The picture as rows of (char, fg, bg) half-block cells, bg None for the terminal's own."""
+    """The picture as rows of (char, fg, bg) cells, bg None for the terminal's own."""
+    # a dot is half a cell wide and a third of a cell high, so 3:4 on a 1:2 cell
+    sx, sy = 6, 8
     with tempfile.TemporaryDirectory() as tmp:
         src, png = os.path.join(tmp, "t.svg"), os.path.join(tmp, "t.png")
-        open(src, "w").write(svg(font_path, ("#f3ecd8", "#cfe6b0"), strands=16))
-        subprocess.run(["rsvg-convert", "-w", str(cols * 8), "-h", str(rows * 16), "--keep-aspect-ratio", src, "-o", png], check=True)
+        open(src, "w").write(svg(font_path, ("#f3ecd8", "#d7ecbc"), strands=22, chunky=True))
+        w, h = cols * 2 * sx, rows * 3 * sy
+        subprocess.run(["rsvg-convert", "-w", str(w), "-h", str(h), "--keep-aspect-ratio", src, "-o", png], check=True)
         big = Image.open(png).convert("RGBA")
-        canvas = Image.new("RGBA", (cols * 8, rows * 16))
-        canvas.paste(big, (0, rows * 16 - big.height))
-        canvas.save(png)
-        big = Image.open(png).convert("RGBA")
-    # average 8x8 blocks with colour weighted by alpha, so thin strokes keep their colour
-    img = Image.new("RGBA", (cols, rows * 2))
-    px = big.load()
-    for cy in range(rows * 2):
-        for cx in range(cols):
+    canvas = Image.new("RGBA", (w, h))
+    canvas.paste(big, (0, h - big.height))
+    px = canvas.load()
+    dots = [[None] * (cols * 2) for _ in range(rows * 3)]
+    for dy in range(rows * 3):
+        for dx in range(cols * 2):
             r = g = b = a = 0
-            for yy in range(cy * 8, cy * 8 + 8):
-                for xx in range(cx * 8, cx * 8 + 8):
+            for yy in range(dy * sy, dy * sy + sy):
+                for xx in range(dx * sx, dx * sx + sx):
                     pr, pg, pb, pa = px[xx, yy]
                     r, g, b, a = r + pr * pa, g + pg * pa, b + pb * pa, a + pa
-            img.putpixel((cx, cy), (r // a, g // a, b // a, a // 64) if a else (0, 0, 0, 0))
+            if a / (sx * sy) > 95:
+                dots[dy][dx] = (r // a, g // a, b // a)
+    lum = lambda c: 0.3 * c[0] + 0.59 * c[1] + 0.11 * c[2]
+    avg = lambda cs: tuple(sum(c[i] for c in cs) // len(cs) for i in range(3))
+    pack = lambda c: (c[0] << 16) | (c[1] << 8) | c[2]
     out = []
-    p = img.load()
-    on = lambda c: c[3] > 70
-    rgb = lambda c: (c[0] << 16) | (c[1] << 8) | c[2]
-    for y in range(rows):
+    for cy in range(rows):
         line = []
-        for x in range(cols):
-            t, b = p[x, 2 * y], p[x, 2 * y + 1]
-            if on(t) and on(b):
-                line.append(("▀", rgb(t), rgb(b)))
-            elif on(t):
-                line.append(("▀", rgb(t), None))
-            elif on(b):
-                line.append(("▄", rgb(b), None))
-            else:
+        for cx in range(cols):
+            six = [dots[cy * 3 + k // 2][cx * 2 + k % 2] for k in range(6)]
+            on = [c for c in six if c]
+            if not on:
                 line.append((" ", 0, None))
+            elif len(on) < 6:
+                bits = sum(1 << k for k, c in enumerate(six) if c)
+                line.append((sextant(bits), pack(avg(on)), None))
+            else:
+                # all six dots coloured: split them into a light and a dark group
+                m = sum(map(lum, on)) / 6
+                light = [c for c in on if lum(c) >= m]
+                dark = [c for c in on if lum(c) < m]
+                if not dark or lum(avg(light)) - lum(avg(dark)) < 18:
+                    line.append(("█", pack(avg(on)), None))
+                else:
+                    bits = sum(1 << k for k, c in enumerate(six) if lum(c) >= m)
+                    line.append((sextant(bits), pack(avg(light)), pack(avg(dark))))
         while line and line[-1][0] == " ":
             line.pop()
         out.append(line)
@@ -178,9 +242,27 @@ def rust(rows):
         lines.append(f"    &[{items}],")
     return (
         "// Made by logo/make.py; don't edit by hand.\n"
-        "/// The wordmark in half blocks: (char, foreground, background or the terminal's own).\n"
+        "/// The wordmark in sextant characters: (char, foreground, background or the terminal's own).\n"
         "pub const LOGO: &[&[(char, u32, Option<u32>)]] = &[\n" + "\n".join(lines) + "\n];\n"
     )
+
+
+def preview(rows, path):
+    """What the terminal version looks like, drawn dot by dot."""
+    dw, dh = 6, 8
+    im = Image.new("RGB", (COLS * 2 * dw, ROWS * 3 * dh), (24, 26, 27))
+    unhex = lambda v: ((v >> 16) & 255, (v >> 8) & 255, v & 255)
+    for y, row in enumerate(rows):
+        for x, (c, fg, bg) in enumerate(row):
+            if c == " ":
+                continue
+            bits = unsextant(c)
+            for k in range(6):
+                col = unhex(fg) if bits >> k & 1 else (unhex(bg) if bg is not None else None)
+                if col:
+                    x0, y0 = (x * 2 + k % 2) * dw, (y * 3 + k // 2) * dh
+                    im.paste(col, (x0, y0, x0 + dw, y0 + dh))
+    im.save(path)
 
 
 if __name__ == "__main__":
@@ -189,20 +271,5 @@ if __name__ == "__main__":
     open(os.path.join(HERE, "logo-dark.svg"), "w").write(svg(font, ("#f3ecd8", "#cfe6b0")))
     rows = cells(font, COLS, ROWS)
     open(os.path.join(HERE, "..", "src", "logo.rs"), "w").write(rust(rows))
-    # a preview of the terminal version, to look at
     if len(sys.argv) > 2:
-        cw, ch = 10, 20
-        im = Image.new("RGB", (COLS * cw, ROWS * ch), (30, 32, 36))
-        for y, row in enumerate(rows):
-            for x, (c, fg, bg) in enumerate(row):
-                hexrgb = lambda v: ((v >> 16) & 255, (v >> 8) & 255, v & 255)
-                top = hexrgb(fg) if c == "▀" else (hexrgb(bg) if bg is not None else None)
-                bot = hexrgb(fg) if c == "▄" else (hexrgb(bg) if bg is not None else None)
-                if c == " ":
-                    continue
-                for yy in range(ch):
-                    colr = top if yy < ch // 2 else bot
-                    if colr:
-                        for xx in range(cw):
-                            im.putpixel((x * cw + xx, y * ch + yy), colr)
-        im.save(sys.argv[2])
+        preview(rows, sys.argv[2])

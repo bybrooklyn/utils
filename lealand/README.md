@@ -65,11 +65,11 @@ With nothing typed yet, the list is the folders you go to most, so `/` then Tab 
 
 ## Opening files
 
-The first time you open a type of file, ll lists the apps that handle it, with KDE's default on top and every other app below. Type to filter. It remembers the pick for that MIME type. `op` asks again and remembers the new answer. Terminal apps like micro run in place and ll comes back when they exit.
+The first time you open a type of file, ll lists the apps that handle it, with KDE's default on top and every other app below. Type to filter. It remembers the pick for that MIME type. `op` asks again and remembers the new answer. The app picked before is marked `current`, and Delete in the list forgets it, so the next open asks. After opening a file with a remembered app, the corner says which app and that `op` picks another. Terminal apps like micro run in place and ll comes back when they exit.
 
 ## Starting up
 
-It opens with a short animation: a few lines on what it read, then the willow, which dissolves into the listing. It takes about half a second, and any key skips it and still does what that key does. `ll --disable-flag` turns it off for good and `ll --enable-flag` brings it back. It also skips itself in terminals under 76 columns or 25 rows.
+It opens with a short animation: a few lines on what it read, then the willow, which dissolves into the listing. It takes about a second, and any key skips it and still does what that key does. `ll --disable-flag` turns it off for good and `ll --enable-flag` brings it back. It also skips itself in terminals under 82 columns or 26 rows.
 
 ## Install
 
