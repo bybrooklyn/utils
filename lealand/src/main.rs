@@ -132,6 +132,7 @@ struct App {
     uid: u32,
     users: HashMap<u32, String>,
     tty_cmd: Option<Command>,
+    tty_wait: bool,
     intro: Option<Instant>,
     cascade: Option<Instant>,
     outro: Option<Instant>,
@@ -254,10 +255,20 @@ fn run(app: &mut App) -> io::Result<()> {
             terminal::disable_raw_mode()?;
             execute!(io::stdout(), cursor::Show)?;
             let tty = || File::options().write(true).open("/dev/tty").map_or(Stdio::inherit(), Stdio::from);
-            if let Err(e) = cmd.stdout(tty()).status() {
+            let status = cmd.stdout(tty()).status();
+            if let Err(e) = &status {
                 app.flash(format!("couldn't run it: {e}"));
             }
             terminal::enable_raw_mode()?;
+            if std::mem::take(&mut app.tty_wait) {
+                if let Ok(st) = status {
+                    let code = st.code().map_or("a signal".to_string(), |c| c.to_string());
+                    print!("\r\n\x1b[38;2;134;148;130m  exited with {code}  ·  any key goes back to lealand\x1b[0m");
+                    io::stdout().flush()?;
+                    while !matches!(event::read()?, Event::Key(k) if k.kind == KeyEventKind::Press) {}
+                    print!("\r\n");
+                }
+            }
             execute!(io::stdout(), EnableMouseCapture)?;
             term = if app.full {
                 execute!(io::stdout(), EnterAlternateScreen)?;
@@ -340,6 +351,7 @@ impl App {
             uid: unsafe { libc::getuid() },
             users: HashMap::new(),
             tty_cmd: None,
+            tty_wait: false,
             intro: None,
             cascade: None,
             outro: None,
@@ -622,7 +634,9 @@ impl App {
                 }
                 (_, key!(right) | key!(enter)) => self.enter(),
                 (_, key!(left)) => {
-                    if let Some(parent) = self.dir.parent().map(Path::to_path_buf) {
+                    // ~ is the top, unless you started somewhere outside it
+                    let at_home = self.dir == jump::home();
+                    if let Some(parent) = self.dir.parent().map(Path::to_path_buf).filter(|_| !at_home) {
                         let name = self.dir.file_name().map(|n| n.to_string_lossy().into_owned());
                         self.go(parent, name, true);
                     }
@@ -650,6 +664,20 @@ impl App {
     fn enter(&mut self) {
         match self.selected() {
             Some(e) if e.dir => self.go(e.path.clone(), None, true),
+            Some(e) if e.name.ends_with(".desktop") => {
+                let mut c = Command::new("gio");
+                c.arg("launch").arg(&e.path);
+                if let Err(err) = detach(c) {
+                    self.flash(format!("couldn't launch it: {err}"));
+                }
+            }
+            Some(e) if e.mode & 0o111 != 0 => {
+                // programs and scripts run here, and wait for a key after so the output can be read
+                let mut c = Command::new(&e.path);
+                c.current_dir(&self.dir);
+                self.tty_cmd = Some(c);
+                self.tty_wait = true;
+            }
             Some(e) => self.open(e.path.clone(), false),
             None => {}
         }
