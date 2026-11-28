@@ -13,7 +13,7 @@ Typing two letters quickly runs something: `cl` opens Claude Code where you are,
    id_ed25519                   411  1y ago       private
 ```
 
-The last column is empty unless something is unusual about the file: `exec`, `private` (only you can read it), `read-only`, `world-writable`, a broken link, or who owns it when that isn't you. The letter before it is git status. Dotfiles are shown, dimmed, after everything else.
+The listing is only as wide as its longest name. The last column is empty unless something is unusual about the file for the folder it is in: `exec`, `private` (only you can read it), `read-only` in a folder you can write to, `world-writable`, a broken link, or an owner that is neither you nor the folder's owner. The letter before it is git status. Dotfiles are shown, dimmed, after everything else.
 
 ## Keys
 

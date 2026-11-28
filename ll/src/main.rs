@@ -113,6 +113,7 @@ struct App {
     git: HashMap<String, char>,
     git_rx: Option<mpsc::Receiver<(PathBuf, HashMap<String, char>)>>,
     counts: HashMap<PathBuf, Option<usize>>,
+    widths: Option<(usize, usize)>,
     preview: Option<(PathBuf, Vec<Line<'static>>)>,
     msg: Option<(String, Instant)>,
     index: Arc<jump::Index>,
@@ -237,6 +238,7 @@ impl App {
             git: HashMap::new(),
             git_rx: None,
             counts: HashMap::new(),
+            widths: None,
             preview: None,
             msg: err.map(|e| (e, Instant::now())),
             index: jump::start(),
@@ -326,6 +328,7 @@ impl App {
         self.scroll = 0;
         self.git.clear();
         self.counts.clear();
+        self.widths = None;
         self.git_rx = Some(git_status(dir.clone()));
         jump::record(&dir);
     }
@@ -622,7 +625,11 @@ impl App {
         if broken {
             f.push("broken link".to_string());
         }
-        if uid != self.uid {
+        // judged against the folder: in /usr/bin everything is root's and read-only, so nothing is
+        let (dir_uid, dir_writable) = fs::metadata(&self.dir).map_or((self.uid, true), |m| {
+            (m.uid(), if m.uid() == self.uid { m.mode() & 0o200 != 0 } else { m.mode() & 0o002 != 0 })
+        });
+        if uid != self.uid && uid != dir_uid {
             f.push(self.user(uid));
         }
         if !dir && mode & 0o111 != 0 {
@@ -632,7 +639,7 @@ impl App {
             f.push("private".into());
         }
         let writable = if uid == self.uid { mode & 0o200 != 0 } else { mode & 0o002 != 0 };
-        if !writable && self.uid != 0 {
+        if !writable && dir_writable && self.uid != 0 {
             f.push("read-only".into());
         }
         if mode & 0o002 != 0 && mode & 0o1000 == 0 && mode & 0o170000 != 0o120000 {
@@ -659,7 +666,13 @@ impl App {
             let w = area.width * 11 / 20;
             (Rect { width: w, ..area }, Some(Rect { x: area.x + w, width: area.width - w, ..area }))
         } else {
-            (area, None)
+            // inline, the view is only as wide as its rows
+            let want = match self.mode {
+                Mode::Browse => self.row_width().max(48),
+                Mode::Name { .. } | Mode::Confirm(_) => self.row_width().max(72),
+                _ => area.width as usize,
+            };
+            (Rect { width: (want as u16).min(area.width), ..area }, None)
         };
         let head = Rect { height: 1, ..main };
         let body = Rect { y: main.y + 1, height: main.height.saturating_sub(1), ..main };
@@ -680,8 +693,10 @@ impl App {
                 if self.entries.is_empty() {
                     lines.push(Line::from("   empty".dark_gray()));
                 }
+                let (names, flags) = self.widths();
+                let name_w = names.min((body.width as usize).saturating_sub(26 + flags)).max(8);
                 for i in self.scroll..(self.scroll + rows).min(self.entries.len()) {
-                    lines.push(self.row(i, body.width as usize));
+                    lines.push(self.row(i, name_w));
                 }
             }
             Mode::Help => {
@@ -796,7 +811,30 @@ impl App {
         Line::from(format!("{pos}? help ").dark_gray())
     }
 
-    fn row(&mut self, i: usize, width: usize) -> Line<'static> {
+    /// Widest name (with its link target) and widest flags in this folder, so columns sit right
+    /// after the names like eza instead of across the whole terminal.
+    fn widths(&mut self) -> (usize, usize) {
+        if let Some(w) = self.widths {
+            return w;
+        }
+        let mut w = (0, 0);
+        for i in 0..self.entries.len() {
+            let e = &self.entries[i];
+            let link = e.link.as_ref().map_or(0, |t| 3 + t.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>());
+            w.0 = w.0.max((e.name.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>() + link).min(40));
+            w.1 = w.1.max(self.flags(i).chars().count());
+        }
+        self.widths = Some(w);
+        w
+    }
+
+    /// Columns besides the name: icon 3, size 9, date 11, git 2, flags after a space.
+    fn row_width(&mut self) -> usize {
+        let (n, f) = self.widths();
+        n + 26 + f
+    }
+
+    fn row(&mut self, i: usize, name_w: usize) -> Line<'static> {
         let flags = self.flags(i);
         let size = {
             let e = &self.entries[i];
@@ -819,8 +857,6 @@ impl App {
         if let Some(t) = &e.link {
             name += &format!(" → {t}");
         }
-        let fixed = 4 + 10 + 11 + 2 + flags.chars().count() + 1;
-        let name_w = width.saturating_sub(fixed).max(8);
         let dim = Style::new().fg(Color::DarkGray);
         let (gc, gs) = match git {
             Some('?') => ("?", Style::new().fg(Color::Magenta)),
