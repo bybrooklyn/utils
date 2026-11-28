@@ -238,7 +238,16 @@ fn run(app: &mut App) -> io::Result<()> {
         }
         app.tick();
     }
-    erase(&mut term, app.full)
+    erase(&mut term, app.full)?;
+    // push everything above into scrollback, so the shell's next prompt starts at the top
+    let y = cursor::position().map_or(0, |p| p.1);
+    let rows = terminal::size().map_or(0, |s| s.1);
+    if y > 0 && rows > 0 {
+        execute!(io::stdout(), cursor::MoveTo(0, rows - 1))?;
+        io::stdout().write_all("\n".repeat(y as usize).as_bytes())?;
+        execute!(io::stdout(), cursor::MoveTo(0, 0))?;
+    }
+    Ok(())
 }
 
 impl App {

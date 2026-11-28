@@ -5,7 +5,7 @@
   </picture>
 </p>
 
-lealand is an eza-style listing you can walk around in. You run it as `ll`. It draws under the prompt instead of taking over the terminal, and when you quit, your shell is in the folder you ended up in.
+lealand is an eza-style listing you can walk around in. You run it as `ll`. It draws under the prompt instead of taking over the terminal, and when you quit, your shell is in the folder you ended up in, with a fresh prompt at the top of the window and everything before it in scrollback.
 
 Typing two letters quickly runs something: `cl` opens Claude Code where you are, `fi` opens Dolphin. Claude Opus 5.5 wrote it.
 
